@@ -1,0 +1,16 @@
+name: storylines
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  # Basics
+  - python=2.7
+  - jupyter
+  # Computation
+  - xarray
+  # I/O
+  - netcdf4
+  # Plotting and visualization
+  - matplotlib
+  - seaborn
+  - cartopy

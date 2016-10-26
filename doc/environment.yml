@@ -1,0 +1,8 @@
+name: storylines-docs
+dependencies:
+  - python=2.7
+  - xarray=0.8.2
+  - numpydoc=0.5
+  - seaborn=0.7.1
+  - ipython=4.0.1
+  - sphinx=1.4.1
