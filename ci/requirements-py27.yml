@@ -8,9 +8,14 @@ dependencies:
   - jupyter
   # Computation
   - xarray
+  - pandas
+  - statsmodels
   # I/O
   - netcdf4
-  # Plotting and visualization
+  - pynio
+  - h5netcdf 
+# Plotting and visualization
   - matplotlib
   - seaborn
   - cartopy
+  - bokeh

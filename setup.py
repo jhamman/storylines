@@ -141,5 +141,5 @@ setup(name=DISTNAME,
       install_requires=INSTALL_REQUIRES,
       tests_require=TESTS_REQUIRE,
       url=URL,
-      packages=find_packages(),
+      packages=['storylines', 'storylines.tools'],
       package_data={'storylines': ['test/data/*']})
