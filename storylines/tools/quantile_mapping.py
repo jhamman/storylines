@@ -7,6 +7,9 @@ def quantile_mapping(input_data, data_to_match, mask=None,
                      alpha=0.4, beta=0.4):
     '''quantile mapping'''
 
+    assert input_data.get_axis_num('time') == 0
+    assert input_data.data_to_match('time') == 0
+
     # Allocate memory for new array
     new = xr.full_like(input_data, np.nan)
 

@@ -2,7 +2,6 @@
 import argparse
 import glob
 import os.path
-# import multiprocessing as mp
 import itertools
 from dateutil.relativedelta import relativedelta
 import pprint
@@ -74,6 +73,11 @@ CUBE_ROOT_TRANSFORM = 3
 FIFTH_ROOT_TRANSFORM = 4
 NO_TRANSFORM = 0
 QUANTILE_TRANSFORM = 1
+
+NO_NORM = 0
+SELF_NORM = 1
+TRAIN_NORM = 2
+
 # TODO: Move to config file
 p_transform = CUBE_ROOT_TRANSFORM
 TRANSFORM = {'TMP_2maboveground': NO_TRANSFORM,
@@ -109,6 +113,10 @@ TRANSFORM = {'TMP_2maboveground': NO_TRANSFORM,
              'MSL_GDS4_SFC': NO_TRANSFORM,
              'CP_GDS4_SFC': p_transform,
              'LSP_GDS4_SFC': p_transform,
+             'T_MEAN': NO_TRANSFORM,
+             'T_RANGE': NO_TRANSFORM,
+             't_range': NO_TRANSFORM,
+             'PREC_TOT': p_transform,
              }
 
 TRAINVARMAP = {'TREFHT': '2T_GDS4_SFC',
@@ -127,7 +135,8 @@ defaults = dict(n_analogs=200,
                 pass_through=False,
                 timezone_offset=0,
                 weight_analogs=True,
-                logistic_from_analog_exceedance=False)
+                logistic_from_analog_exceedance=False,
+                normalization_method=SELF_NORM)
 
 kFILL_VALUE = -9999
 LOGISTIC_THRESH = {'pcp': 0,
@@ -135,7 +144,8 @@ LOGISTIC_THRESH = {'pcp': 0,
                    'tas': kFILL_VALUE,
                    'tasmin': kFILL_VALUE,
                    'tasmax': kFILL_VALUE,
-                   't_mean': kFILL_VALUE}
+                   't_mean': kFILL_VALUE,
+                   't_range': kFILL_VALUE}
 
 # TODO: add mechanisim for timezone offset
 GARD_TIMEFORMAT = '%Y-%m-%d %H:%M:%S'
@@ -381,6 +391,8 @@ def main():
                         kwargs['train_transform'] = NO_TRANSFORM
                         kwargs['predict_transform'] = NO_TRANSFORM
                         kwargs['obs_transform'] = NO_TRANSFORM
+                        kwargs['normalization_method'] = NO_NORM
+                        kwargs['transformations'] = NO_TRANSFORM
 
                     # Store the namelist filepath for execuation
                     namelists.append(namelist)
