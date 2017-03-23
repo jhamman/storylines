@@ -4,7 +4,7 @@ import re
 import sys
 import warnings
 
-from setuptools import setup, find_packages
+from setuptools import setup
 
 MAJOR = 0
 MINOR = 0
@@ -126,6 +126,7 @@ short_version = '%s'
         a.write(cnt % (FULLVERSION, VERSION))
     finally:
         a.close()
+
 
 if write_version:
     write_version_py()

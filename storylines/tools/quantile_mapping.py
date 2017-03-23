@@ -1,5 +1,5 @@
 import numpy as np
-import pandas as pd
+import dask.array as da
 import xarray as xr
 
 
@@ -8,15 +8,13 @@ def quantile_mapping(input_data, data_to_match, mask=None,
     '''quantile mapping'''
 
     assert input_data.get_axis_num('time') == 0
-    assert input_data.data_to_match('time') == 0
-
-    # Allocate memory for new array
-    new = xr.full_like(input_data, np.nan)
+    assert data_to_match.get_axis_num('time') == 0
+    assert input_data.shape[1:] == data_to_match.shape[1:]
 
     # Make mask if mask is one was not provided
     if mask is None:
         d0 = input_data.isel(time=0, drop=True)
-        mask = xr.Variable(d0.dims, ~pd.isnull(d0))
+        mask = xr.Variable(d0.dims, ~da.isnull(d0))
 
     # quantiles for the input data
     n = len(input_data['time'])
@@ -26,15 +24,35 @@ def quantile_mapping(input_data, data_to_match, mask=None,
     n = len(data_to_match['time'])
     x0 = (np.arange(1, n + 1) - alpha) / (n + 1. - alpha - beta)
 
-    for (i, j), m in np.ndenumerate(mask):
-        if m:
+    def qmap(data, like, mask):
+        # Use numpy to sort these arrays before we loop through each variable
+        sort_inds_all = np.argsort(data, axis=0)
+        sorted_all = np.sort(like, axis=0)
+
+        ii, jj = mask.nonzero()
+
+        new = np.full_like(data, np.nan)
+
+        for i, j in zip(ii, jj):
             # Sorted Observations
-            y0 = np.sort(data_to_match[:, i, j])
+            y0 = sorted_all[:, i, j]
             # Indicies that would sort the input data
-            sort_inds = np.argsort(input_data[:, i, j])
+            sort_inds = sort_inds_all[:, i, j]
             new[sort_inds, i, j] = np.interp(x1, x0, y0)  # TODO: handle edges
 
-    return new
+        return new
+
+    if isinstance(input_data.data, da.Array):
+        # dask arrays
+        new = da.map_blocks(qmap, input_data.data, data_to_match.data,
+                            mask.data, chunks=input_data.data.chunks,
+                            name='qmap')
+    else:
+        # numpy arrays
+        new = qmap(input_data.data, data_to_match.data, mask.data)
+
+    return xr.DataArray(new, dims=input_data.dims, coords=input_data.coords,
+                        attrs=input_data.attrs, name=input_data.name)
 
 
 def apply_quantile_mapping_by_month(input_data, data_to_match, **kwargs):

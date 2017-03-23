@@ -1,4 +1,4 @@
-
+#!/usr/bin/env python
 import argparse
 
 # import numpy as np
@@ -77,7 +77,7 @@ def add_random_effect(ds, da_rand, var=None, root=1.,
     rand = da_rand.sel(time=slice(t0, t1))
     if root == 1.:
         da_errors = ds[var] + (ds[e_var] * rand)
-    if root == 3:
+    if False:  # root == 3:
         if isinstance(ds[var].data, dask.array.Array):
             da_errors = (np.map_blocks(cbrt, ds[var]) +
                          (ds[e_var] * rand)) ** root
@@ -91,14 +91,15 @@ def add_random_effect(ds, da_rand, var=None, root=1.,
 
         if isinstance(pop_thresh, float):
             # mask where POP is less than the threshold
-            da_errors = np.where(da_pop > pop_thresh, da_errors, 0)
+            da_errors.data = np.where(da_pop.data > pop_thresh.data,
+                                      da_errors.data, 0)
         elif isinstance(pop_thresh, (xr.DataArray)):
             t0, t1 = str(ds.time.data[0]), str(ds.time.data[-1])
             # mask where POP is less than a uniform transform of rand
             p_rand_uniform = pop_thresh.sel(time=slice(t0, t1))
-            da_errors = np.where(np.logical_and(da_pop > (1 - p_rand_uniform),
-                                                (da_pop > pop_thresh)),
-                                 da_errors, 0)
+            da_errors.data = np.where(np.logical_and(
+                da_pop.data > (1 - p_rand_uniform.data),
+                da_errors.data > 0), da_errors.data, 0)
         else:
             raise TypeError('cannot apply POP mask with %s' % type(pop_thresh))
 
@@ -109,24 +110,26 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
                         template=None, obs_mask=None,
                         calendar='standard',
                         variables=['pcp', 't_mean', 't_range'],
+                        rename_vars=None,
                         roots={'pcp': 3., 't_mean': 1, 't_range': 1},
                         rand_vars={'pcp': 'p_rand', 't_mean': 't_rand',
                                    't_range': 't_rand'},
-                        quantile_mapping=False):
+                        quantile_mapping=False, chunks=None):
 
     if not isinstance(obs_ds, xr.Dataset):
         # we'll assume that obs_ds is a string/path/or something that
         # xr.open_dataset can open, if not, we'll raise an error right away
-        obs_ds = xr.open_dataset(obs_ds)
+        obs_ds = xr.open_dataset(obs_ds, chunks=chunks)
+    if rename_vars is not None:
+        obs_ds = obs_ds.rename(rename_vars)
     if not isinstance(rand_ds, xr.Dataset):
         # we'll assume that obs_ds is a string/path/or something that
         # xr.open_dataset can open, if not, we'll raise an error right away
-        rand_ds = xr.open_dataset(rand_ds)
+        rand_ds = xr.open_dataset(rand_ds, chunks=chunks)
 
     ds_out = xr.Dataset()
     for var in variables:
-        root = roots[var]
-        rand_var = rand_vars[var]
+
         ds_list = []
         for drange in periods:
 
@@ -139,18 +142,30 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
                 ds.merge(xr.open_dataset(pre + '{}_logistic.nc'.format(var)),
                          inplace=True)
                 is_precip = True
-            except FileNotFoundError:
+            except (FileNotFoundError, OSError):
                 is_precip = False
 
             ds = make_gard_like_obs(ds, obs_ds)
+            if chunks is not None:
+                ds = ds.chunk(chunks=chunks)
 
             units = _get_units_from_drange(drange)
             ds['time'] = nctime_to_nptime(
-                num2date(np.arange(0, ds.dims['time']),
+                num2date(np.arange(0, ds.dims['time'], chunks=ds.dims['time']),
                          units, calendar=calendar))
 
             ds_list.append(ds)
         ds = xr.concat(ds_list, dim='time')
+
+        if rename_vars is not None and var in rename_vars:
+            rename_dict = rename_vars.copy()
+            rename_dict['{}_error'.format(var)] = '{}_error'.format(rename_vars[var])
+            rename_dict['{}_exceedence_probability'.format(var)] = '{}_exceedence_probability'.format(rename_vars[var])
+            ds = ds.rename(rename_dict)
+            var = rename_vars[var]
+
+        assert var in attrs
+        assert var in encoding
 
         if se is not 'pass_through':
             # TODO: add additional args
@@ -158,6 +173,9 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
                 pop_thresh = rand_ds['p_rand_uniform']
             else:
                 pop_thresh = None
+
+            root = roots[var]
+            rand_var = rand_vars[var]
             da_errors = add_random_effect(ds, rand_ds[rand_var],
                                           var=var, root=root,
                                           is_precip=is_precip,
@@ -165,7 +183,8 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
         else:
             da_errors = ds[var]
 
-        t0, t1 = str(da_errors.data[0]), str(da_errors.data[-1])
+        t0 = str(da_errors.coords['time'].data[0])
+        t1 = str(da_errors.coords['time'].data[-1])
 
         if quantile_mapping:
             # offset zeros in GARD data for precip
@@ -177,43 +196,28 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
                     rand_ds['p_rand_uniform'].sel(time=slice(t0, t1)).data)
 
             # Quantile mapping
-            if isinstance(da_errors.data, dask.array.Array):
-                da_errors = np.map_blocks(quantile_mapping, da_errors.data,
-                                          obs_ds[var].data)
-            else:
-                da_errors = quantile_mapping(da_errors, obs_ds[var],
-                                             mask=obs_mask)
-
+            da_errors = quantile_mapping(da_errors, obs_ds[var],
+                                         mask=obs_mask)
         ds_out[var] = da_errors
         ds_out[var].attrs = attrs[var]
         ds_out[var].encoding = encoding[var]
 
     if 't_range' in variables and 't_mean' in variables:
-        ds_out['t_min'] = ds['t_mean'] - 0.5 * ds['t_range']
-        ds_out['t_max'] = ds['t_mean'] + 0.5 * ds['t_range']
+        ds_out['t_min'] = ds_out['t_mean'] - 0.5 * ds_out['t_range']
+        ds_out['t_max'] = ds_out['t_mean'] + 0.5 * ds_out['t_range']
+        for var in ['t_max', 't_min']:
+            ds_out[var].attrs = attrs[var]
+        ds_out = ds_out.drop('t_mean')
 
-    if obs_mask:
+    if obs_mask is not None:
         ds_out = ds_out.where(obs_mask)
 
     # Add metadata
     ds_out['time'].encoding['calendar'] = calendar
     ds_out['time'].encoding['units'] = units
 
+    ds_out.info()
     return ds_out
-
-# drange = '{}-{}'.format(periods[0].split('-')[0],
-#                         periods[-1].split('-')[1])
-# pre = out_template.format(se=se, drange=drange, scen=scen)
-# mm_fname_out = pre + 'mm.nc'
-# dm_fname_out = pre + 'dm.nc'
-#
-# print(dm_fname_out)
-#
-# ds_out.resample('MS', dim='time', how='mean',
-#                 keep_attrs=True).to_netcdf(mm_fname_out, encoding=encoding,
-#                                            unlimited_dims=['time'])
-#
-# ds_out.to_netcdf(dm_fname_out, encoding=encoding, unlimited_dims=['time'])
 
 
 def command_line_tool():
@@ -229,8 +233,23 @@ def command_line_tool():
 
     # move logic from notebook here
 
+# drange = '{}-{}'.format(periods[0].split('-')[0],
+#                         periods[-1].split('-')[1])
+# pre = out_template.format(se=se, drange=drange, scen=scen)
+# mm_fname_out = pre + 'mm.nc'
+# dm_fname_out = pre + 'dm.nc'
+#
+# print(dm_fname_out)
+#
+# ds_out.resample('MS', dim='time', how='mean',
+#                 keep_attrs=True).to_netcdf(mm_fname_out, encoding=encoding,
+#                                            unlimited_dims=['time'])
+#
+# ds_out.to_netcdf(dm_fname_out, encoding=encoding, unlimited_dims=['time'])
+
     print(config)
 
 
-if __name__ == 'main':
+if __name__ == '__main__':
+    print('post_process_gard_output')
     command_line_tool()

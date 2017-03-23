@@ -58,6 +58,7 @@ def file_chmod(infile, mode='664'):
     if os.stat(infile).st_uid == os.getuid():
         os.chmod(infile, int(mode, 8))
 
+
 pp = pprint.PrettyPrinter(indent=4)
 
 FILELIST_TEMPLATE = \
@@ -84,6 +85,7 @@ TRANSFORM = {'TMP_2maboveground': NO_TRANSFORM,
              'PRES_meansealevel': NO_TRANSFORM,
              'APCP_surface': p_transform,
              'pcp': p_transform,
+             'pcp_mean': p_transform,
              'pr': p_transform,
              't_mean': NO_TRANSFORM,
              'tmp_2m': NO_TRANSFORM,
@@ -114,6 +116,7 @@ TRANSFORM = {'TMP_2maboveground': NO_TRANSFORM,
              'CP_GDS4_SFC': p_transform,
              'LSP_GDS4_SFC': p_transform,
              'T_MEAN': NO_TRANSFORM,
+             'tmean_mean': NO_TRANSFORM,
              'T_RANGE': NO_TRANSFORM,
              't_range': NO_TRANSFORM,
              'PREC_TOT': p_transform,
@@ -140,12 +143,14 @@ defaults = dict(n_analogs=200,
 
 kFILL_VALUE = -9999
 LOGISTIC_THRESH = {'pcp': 0,
+                   'pcp_mean': 0,
                    'pr': 0,
                    'tas': kFILL_VALUE,
                    'tasmin': kFILL_VALUE,
                    'tasmax': kFILL_VALUE,
                    't_mean': kFILL_VALUE,
-                   't_range': kFILL_VALUE}
+                   't_range': kFILL_VALUE,
+                   'tmean_mean': kFILL_VALUE}
 
 # TODO: add mechanisim for timezone offset
 GARD_TIMEFORMAT = '%Y-%m-%d %H:%M:%S'
@@ -345,12 +350,12 @@ def main():
                     kwargs['train_nfiles'] = file_lists_len[filelistkey(
                         var=train_var_list[0], **train_kwargs)]
                     kwargs['train_nvars'] = len(train_var_list)
-                    kwargs['train_vars'] = ','.join(train_var_list)
+                    kwargs['train_vars'] = _make_variables_str(train_var_list)
                     kwargs['train_transform'] = get_transform_str(
                         train_var_list, mode)
                     kwargs['train_filelists'] = _make_filelist_str(
                         file_lists, train_var_list, **train_kwargs)
-                    kwargs['train_calendar'] = train_calendar
+                    kwargs['train_calendar'] = '"{}"'.format(train_calendar)
 
                     # prediction_parameters section
                     predict_kwargs = dict(dset=dataset,
@@ -360,7 +365,7 @@ def main():
                         var=var_list[0], **predict_kwargs)]
                     nvars = len(var_list)
                     kwargs['predict_nvars'] = nvars
-                    kwargs['predict_vars'] = ','.join(var_list)
+                    kwargs['predict_vars'] = _make_variables_str(var_list)
                     transformations = ','.join(
                         [str(QUANTILE_TRANSFORM)] * nvars)
                     kwargs['transformations'] = transformations
@@ -368,8 +373,9 @@ def main():
                                                                     mode)
                     kwargs['predict_filelists'] = _make_filelist_str(
                         file_lists, var_list, **predict_kwargs)
-                    kwargs['predict_calendar'] = config['Calendars'].get(
-                        gcm, config['Calendars'].get('all', None))
+                    kwargs['predict_calendar'] = '"{}"'.format(
+                        config['Calendars'].get(gcm, config['Calendars'].get(
+                            'all', None)))
 
                     # obs_parameters section
                     obs_kwargs = dict(dset=dataset,
@@ -380,11 +386,11 @@ def main():
                         var=var, **obs_kwargs)
                     kwargs['obs_nfiles'] = file_lists_len[filelistkey(
                         var=var, **obs_kwargs)]
-                    kwargs['obs_vars'] = var
+                    kwargs['obs_vars'] = _make_variables_str(var)
                     kwargs['obs_transform'] = TRANSFORM[var]
                     kwargs['obs_filelists'] = _make_filelist_str(
                         file_lists, [var], **obs_kwargs)
-                    kwargs['obs_calendar'] = obs_calendar
+                    kwargs['obs_calendar'] = '"{}"'.format(obs_calendar)
 
                     # Special cases for "pass_through" option:
                     if mode == 'pass_through':
@@ -540,6 +546,14 @@ def _make_filelist_str(flists, variables, **kwargs):
     for var in variables:
         l.append('"{path}"'.format(
             path=flists[filelistkey(var=var, **kwargs)]))
+    s = ','.join(l)
+    return s
+
+
+def _make_variables_str(variables):
+    l = []
+    for var in list_like(variables):
+        l.append('"{}"'.format(var))
     s = ','.join(l)
     return s
 
