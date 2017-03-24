@@ -11,6 +11,7 @@ from netCDF4 import num2date
 from xarray.conventions import nctime_to_nptime
 
 from .gard_utils import read_config
+from .quantile_mapping import quantile_mapping_by_group
 
 attrs = {'pcp': {'units': 'mm', 'long_name': 'precipitation',
                  'comment': 'random effects applied'},
@@ -46,24 +47,23 @@ def make_gard_like_obs(ds, obs, mask=None):
     return ds
 
 
-def add_random_effect(ds, da_rand, var=None, root=1.,
-                      is_precip=False, pop_thresh=None):
+def add_random_effect(ds, da_rand, var=None, root=1., logistic_thresh=None):
     '''Add random effects to dataset `ds`
 
     Parameters
     ----------
     ds : xarray.Dataset
         Input dataset with variables variable (e.g. `tas`) and error terms.
-        if `is_precip=True`, must also include `pcp_exceedence_probability`
-        variable.
+        If `{var}_exceedence_probability` is a variable in ``ds``, it will also
+        be applied to the error term.
     da_rand : xarray.DataArray
         Input spatially correlated random field
+    var : str
+        Variable name in ``ds`` that random effects will be added to
     root : float
         Root used to transform
-    is_precip : bool
-        True if the quantity being calculated is precipitation
-    pop_thresh : float or xr.DataArray
-        Threshold value for POP (required if `is_precip==True`).
+    logistic_thresh : float or xr.DataArray
+        Logistic threshold value.
 
     Returns
     -------
@@ -71,13 +71,13 @@ def add_random_effect(ds, da_rand, var=None, root=1.,
         Like `ds[var]` except da_errors includes random effects.
     '''
 
-    t0, t1 = str(ds.time.data[0]), str(ds.time.data[-1])
+    t0, t1 = ds.time.data[0], ds.time.data[-1]
 
     e_var = '{}_error'.format(var)
     rand = da_rand.sel(time=slice(t0, t1))
     if root == 1.:
         da_errors = ds[var] + (ds[e_var] * rand)
-    if False:  # root == 3:
+    elif root == 3:
         if isinstance(ds[var].data, dask.array.Array):
             da_errors = (np.map_blocks(cbrt, ds[var]) +
                          (ds[e_var] * rand)) ** root
@@ -86,22 +86,24 @@ def add_random_effect(ds, da_rand, var=None, root=1.,
     else:
         da_errors = ((ds[var] ** (1./root)) + (ds[e_var] * rand)) ** root
 
-    if is_precip:
-        da_pop = ds['{}_exceedence_probability'.format(var)]
+    exceedence_var = '{}_exceedence_probability'.format(var)
+    if exceedence_var in ds:
+        da_pop = ds[exceedence_var]
 
-        if isinstance(pop_thresh, float):
+        if isinstance(logistic_thresh, float):
             # mask where POP is less than the threshold
-            da_errors.data = np.where(da_pop.data > pop_thresh.data,
+            da_errors.data = np.where(da_pop.data > logistic_thresh.data,
                                       da_errors.data, 0)
-        elif isinstance(pop_thresh, (xr.DataArray)):
-            t0, t1 = str(ds.time.data[0]), str(ds.time.data[-1])
+        elif isinstance(logistic_thresh, xr.DataArray):
+            t0, t1 = ds.time.data[0], ds.time.data[-1]
             # mask where POP is less than a uniform transform of rand
-            p_rand_uniform = pop_thresh.sel(time=slice(t0, t1))
+            p_rand_uniform = logistic_thresh.sel(time=slice(t0, t1))
             da_errors.data = np.where(np.logical_and(
                 da_pop.data > (1 - p_rand_uniform.data),
                 da_errors.data > 0), da_errors.data, 0)
         else:
-            raise TypeError('cannot apply POP mask with %s' % type(pop_thresh))
+            raise TypeError('cannot apply POP mask with %s' % type(
+                logistic_thresh))
 
     return da_errors
 
@@ -115,6 +117,51 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
                         rand_vars={'pcp': 'p_rand', 't_mean': 't_rand',
                                    't_range': 't_rand'},
                         quantile_mapping=False, chunks=None):
+
+    '''Top level function for processing raw gard output
+
+    Parameters
+    ----------
+    se : str
+        Set name
+    scen : str
+        Scenario name
+    periods : list of str
+        List of periods (e.g. ['19200101-19291231', '19300101-19391231'])
+    obs_ds : xr.Dataset
+        Dataset with observations
+    rand_ds : xr.Dataset
+        Dataset with random fields
+    template : str
+        Filepath template string
+    obs_mask : xr.DataArray
+        Mask to apply to GARD datasets (optional)
+    calendar : str
+        Calendar to use for time coordinates
+    variables : list of str
+        List of variable names to process
+    rename_vars : dict
+        Dictionary mapping from ``variables`` to obs variable names
+    roots : dict
+        Dictionary of transform roots
+    rand_vars : dict
+        Dictionary mapping from ``variables`` to ``rand_ds`` variable names
+    quantile_mapping : boolean or str or array
+        If True, perform quantile mapping over full record. If str or array,
+        perform quantile mapping by group. If False, do not perform any quantile
+        mapping.
+
+    Returns
+    -------
+    ds : xr.Dataset
+        Post processed GARD dataset
+
+    See Also
+    --------
+    add_random_effect
+    make_gard_like_obs
+    quantile_mapping_by_group
+    '''
 
     if not isinstance(obs_ds, xr.Dataset):
         # we'll assume that obs_ds is a string/path/or something that
@@ -141,9 +188,8 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
             try:
                 ds.merge(xr.open_dataset(pre + '{}_logistic.nc'.format(var)),
                          inplace=True)
-                is_precip = True
             except (FileNotFoundError, OSError):
-                is_precip = False
+                pass
 
             ds = make_gard_like_obs(ds, obs_ds)
             if chunks is not None:
@@ -159,8 +205,10 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
 
         if rename_vars is not None and var in rename_vars:
             rename_dict = rename_vars.copy()
-            rename_dict['{}_error'.format(var)] = '{}_error'.format(rename_vars[var])
-            rename_dict['{}_exceedence_probability'.format(var)] = '{}_exceedence_probability'.format(rename_vars[var])
+            ervar = '{}_error'.format(rename_vars[var])
+            rename_dict['{}_error'.format(var)] = ervar
+            exvar = '{}_exceedence_probability'.format(rename_vars[var])
+            rename_dict['{}_exceedence_probability'.format(var)] = exvar
             ds = ds.rename(rename_dict)
             var = rename_vars[var]
 
@@ -169,35 +217,40 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
 
         if se is not 'pass_through':
             # TODO: add additional args
-            if is_precip:
-                pop_thresh = rand_ds['p_rand_uniform']
+            if '{}_exceedence_probability'.format(var) in ds:
+                logistic_thresh = rand_ds['p_rand_uniform']
             else:
-                pop_thresh = None
+                logistic_thresh = None
 
             root = roots[var]
             rand_var = rand_vars[var]
             da_errors = add_random_effect(ds, rand_ds[rand_var],
                                           var=var, root=root,
-                                          is_precip=is_precip,
-                                          pop_thresh=pop_thresh)
+                                          logistic_thresh=logistic_thresh)
         else:
             da_errors = ds[var]
 
         t0 = str(da_errors.coords['time'].data[0])
         t1 = str(da_errors.coords['time'].data[-1])
 
-        if quantile_mapping:
+        if quantile_mapping is not False:
             # offset zeros in GARD data for precip
             # TODO: update this with new dask/xarray where
-            if is_precip:
+            if '{}_exceedence_probability'.format(var) in ds:
                 da_errors.data = np.where(
                     da_errors.data > 0,  # where precip is non-zero
                     da_errors.data + 1,  # add 1
                     rand_ds['p_rand_uniform'].sel(time=slice(t0, t1)).data)
 
+            # Unpack the grouper for quantile mapping
+            if quantile_mapping is True:
+                grouper = None
+            else:
+                grouper = quantile_mapping
             # Quantile mapping
-            da_errors = quantile_mapping(da_errors, obs_ds[var],
-                                         mask=obs_mask)
+            da_errors = quantile_mapping_by_group(da_errors, obs_ds[var],
+                                                  mask=obs_mask,
+                                                  grouper=grouper)
         ds_out[var] = da_errors
         ds_out[var].attrs = attrs[var]
         ds_out[var].encoding = encoding[var]
@@ -209,6 +262,7 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
             ds_out[var].attrs = attrs[var]
         ds_out = ds_out.drop('t_mean')
 
+    # mask sure the dataset is properly masked
     if obs_mask is not None:
         ds_out = ds_out.where(obs_mask)
 
@@ -216,7 +270,6 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
     ds_out['time'].encoding['calendar'] = calendar
     ds_out['time'].encoding['units'] = units
 
-    ds_out.info()
     return ds_out
 
 
