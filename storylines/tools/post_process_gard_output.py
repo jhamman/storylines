@@ -1,11 +1,11 @@
 #!/usr/bin/env python
 import argparse
 
-# import numpy as np
+import numpy as np
 import dask
-import dask.array as np
 import xarray as xr
 from scipy.special import cbrt
+from scipy.stats import norm
 
 from netCDF4 import num2date
 from xarray.conventions import nctime_to_nptime
@@ -47,7 +47,8 @@ def make_gard_like_obs(ds, obs, mask=None):
     return ds
 
 
-def add_random_effect(ds, da_rand, var=None, root=1., logistic_thresh=None):
+def add_random_effect(ds, da_normal, da_uniform=None,
+                      var=None, root=1., logistic_thresh=None):
     '''Add random effects to dataset `ds`
 
     Parameters
@@ -56,14 +57,14 @@ def add_random_effect(ds, da_rand, var=None, root=1., logistic_thresh=None):
         Input dataset with variables variable (e.g. `tas`) and error terms.
         If `{var}_exceedence_probability` is a variable in ``ds``, it will also
         be applied to the error term.
-    da_rand : xarray.DataArray
-        Input spatially correlated random field
+    da_normal : xarray.DataArray
+        Input spatially correlated random field (normal distribution)
+    da_uniform : xarray.DataArray
+        Input spatially correlated random field (uniform distribution)
     var : str
         Variable name in ``ds`` that random effects will be added to
     root : float
         Root used to transform
-    logistic_thresh : float or xr.DataArray
-        Logistic threshold value.
 
     Returns
     -------
@@ -71,39 +72,51 @@ def add_random_effect(ds, da_rand, var=None, root=1., logistic_thresh=None):
         Like `ds[var]` except da_errors includes random effects.
     '''
 
-    t0, t1 = ds.time.data[0], ds.time.data[-1]
+    t0, t1 = str(ds.time.data[0]), str(ds.time.data[-1])
 
-    e_var = '{}_error'.format(var)
-    rand = da_rand.sel(time=slice(t0, t1))
-    if root == 1.:
-        da_errors = ds[var] + (ds[e_var] * rand)
-    elif root == 3:
-        if isinstance(ds[var].data, dask.array.Array):
-            da_errors = (np.map_blocks(cbrt, ds[var]) +
-                         (ds[e_var] * rand)) ** root
-        else:
-            da_errors = (cbrt(ds[var]) + (ds[e_var] * rand)) ** root
-    else:
-        da_errors = ((ds[var] ** (1./root)) + (ds[e_var] * rand)) ** root
+    da = ds[var]
+    da_errors = ds['{}_error'.format(var)]
 
     exceedence_var = '{}_exceedence_probability'.format(var)
     if exceedence_var in ds:
-        da_pop = ds[exceedence_var]
 
-        if isinstance(logistic_thresh, float):
-            # mask where POP is less than the threshold
-            da_errors.data = np.where(da_pop.data > logistic_thresh.data,
-                                      da_errors.data, 0)
-        elif isinstance(logistic_thresh, xr.DataArray):
-            t0, t1 = ds.time.data[0], ds.time.data[-1]
-            # mask where POP is less than a uniform transform of rand
-            p_rand_uniform = logistic_thresh.sel(time=slice(t0, t1))
-            da_errors.data = np.where(np.logical_and(
-                da_pop.data > (1 - p_rand_uniform.data),
-                da_errors.data > 0), da_errors.data, 0)
+        # Get the array of uniform errors
+        r_uniform = da_uniform.sel(time=slice(t0, t1))
+        # Get the exceedence variable (e.g. POP)
+        da_ex = ds[exceedence_var]
+
+        # Allocate a few arrays
+        new_uniform = xr.zeros_like(r_uniform)
+        r_normal = xr.zeros_like(r_uniform)
+
+        # Mask where precip occurs
+        mask = r_uniform > (1 - da_ex)
+
+        # Rescale the uniform distribution
+        new_uniform = ((r_uniform - 1) / da_ex) + 1
+
+        # Where precip occurs, get the normal distribution equivalent of
+        # new_uniform
+        # r_normal.data[mask] = norm.ppf(new_uniform.data[mask])
+        r_normal = new_uniform.pipe(norm.ppf)
+    else:
+        mask = None
+        r_normal = da_normal.sel(time=slice(t0, t1))
+
+    if root == 1.:
+        da_errors = da + (da_errors * r_normal)
+    elif root == 3:
+        if isinstance(da.data, dask.array.Array):
+            da_errors.data = (dask.array.map_blocks(cbrt, da.data) +
+                              (da_errors.data * r_normal.data)) ** root
         else:
-            raise TypeError('cannot apply POP mask with %s' % type(
-                logistic_thresh))
+            da_errors = (cbrt(da) + (da_errors * r_normal)) ** root
+    else:
+        da_errors = ((da ** (1./root)) + (da_errors * r_normal)) ** root
+
+    if mask is not None:
+        da_errors.data = dask.array.where(mask, da_errors.data, 0)
+        da_errors.data = dask.array.maximum(da_errors.data, 0.)
 
     return da_errors
 
@@ -148,8 +161,8 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
         Dictionary mapping from ``variables`` to ``rand_ds`` variable names
     quantile_mapping : boolean or str or array
         If True, perform quantile mapping over full record. If str or array,
-        perform quantile mapping by group. If False, do not perform any quantile
-        mapping.
+        perform quantile mapping by group. If False, do not perform any
+        quantile mapping.
 
     Returns
     -------
@@ -197,7 +210,7 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
 
             units = _get_units_from_drange(drange)
             ds['time'] = nctime_to_nptime(
-                num2date(np.arange(0, ds.dims['time'], chunks=ds.dims['time']),
+                num2date(np.arange(0, ds.dims['time']),
                          units, calendar=calendar))
 
             ds_list.append(ds)
@@ -216,28 +229,21 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
         assert var in encoding
 
         if se is not 'pass_through':
-            # TODO: add additional args
-            if '{}_exceedence_probability'.format(var) in ds:
-                logistic_thresh = rand_ds['p_rand_uniform']
-            else:
-                logistic_thresh = None
-
             root = roots[var]
             rand_var = rand_vars[var]
             da_errors = add_random_effect(ds, rand_ds[rand_var],
-                                          var=var, root=root,
-                                          logistic_thresh=logistic_thresh)
+                                          rand_ds['p_rand_uniform'],
+                                          var=var, root=root)
         else:
             da_errors = ds[var]
 
-        t0 = str(da_errors.coords['time'].data[0])
-        t1 = str(da_errors.coords['time'].data[-1])
-
         if quantile_mapping is not False:
+            t0 = str(da_errors.coords['time'].data[0])
+            t1 = str(da_errors.coords['time'].data[-1])
             # offset zeros in GARD data for precip
             # TODO: update this with new dask/xarray where
             if '{}_exceedence_probability'.format(var) in ds:
-                da_errors.data = np.where(
+                da_errors.data = dask.array.where(
                     da_errors.data > 0,  # where precip is non-zero
                     da_errors.data + 1,  # add 1
                     rand_ds['p_rand_uniform'].sel(time=slice(t0, t1)).data)

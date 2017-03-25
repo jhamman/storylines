@@ -88,8 +88,8 @@ def quantile_mapping(input_data, data_to_match, mask=None,
                         attrs=input_data.attrs, name=input_data.name)
 
 
-def apply_quantile_mapping_by_group(input_data, data_to_match,
-                                    grouper='time.month', **kwargs):
+def quantile_mapping_by_group(input_data, data_to_match,
+                              grouper='time.month', **kwargs):
     '''quantile mapping between `input_data` and `data_to_match by group`
 
     Parameters
