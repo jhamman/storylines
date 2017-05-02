@@ -78,11 +78,12 @@ def quantile_mapping(input_data, data_to_match, mask=None,
     if isinstance(input_data.data, da.Array):
         # dask arrays
         new = da.map_blocks(qmap, input_data.data, data_to_match.data,
-                            mask.data, chunks=input_data.data.chunks,
+                            mask.data, dtype=input_data.data.dtype,
+                            chunks=input_data.data.chunks,
                             name='qmap')
     else:
         # numpy arrays
-        new = qmap(input_data.data, data_to_match.data, mask.data)
+        new = qmap(input_data.values, data_to_match.values, mask.values)
 
     return xr.DataArray(new, dims=input_data.dims, coords=input_data.coords,
                         attrs=input_data.attrs, name=input_data.name)

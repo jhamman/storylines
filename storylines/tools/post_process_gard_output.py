@@ -1,5 +1,8 @@
 #!/usr/bin/env python
+import os
 import argparse
+import itertools
+from dateutil.relativedelta import relativedelta
 
 import numpy as np
 import dask
@@ -10,8 +13,9 @@ from scipy.stats import norm
 from netCDF4 import num2date
 from xarray.conventions import nctime_to_nptime
 
-from .gard_utils import read_config
-from .quantile_mapping import quantile_mapping_by_group
+from storylines.tools.gard_utils import (read_config, get_drange_chunks,
+                                         list_like, _tslice_to_str)
+from storylines.tools.quantile_mapping import quantile_mapping_by_group
 
 attrs = {'pcp': {'units': 'mm', 'long_name': 'precipitation',
                  'comment': 'random effects applied'},
@@ -32,7 +36,15 @@ encoding = {'pcp': {'_FillValue': -9999},
 
 
 def _get_units_from_drange(d):
-    return 'days since %s-%s-%s' % (d[:4], d[4:6], d[6:8])
+
+    dsplit = d.split('-')
+
+    if len(dsplit) <= 2:
+        # e.g. `d = 19200101-19291231` or just `d = 19200101`
+        return 'days since {0}-{1}-{2}'.format(d[:4], d[4:6], d[6:8])
+    else:
+        # e.g. `d = 1920-01-01`
+        return 'days since {:04}-{:02}-{:02}'.format(*map(int, dsplit))
 
 
 def make_gard_like_obs(ds, obs, mask=None):
@@ -48,7 +60,8 @@ def make_gard_like_obs(ds, obs, mask=None):
 
 
 def add_random_effect(ds, da_normal, da_uniform=None,
-                      var=None, root=1., logistic_thresh=None):
+                      var=None, root=1., logistic_thresh=None,
+                      force_load=False):
     '''Add random effects to dataset `ds`
 
     Parameters
@@ -82,6 +95,9 @@ def add_random_effect(ds, da_normal, da_uniform=None,
 
         # Get the array of uniform errors
         r_uniform = da_uniform.sel(time=slice(t0, t1))
+        if force_load:
+            print('loading uniform random data')
+            r_uniform = r_uniform.load()
         # Get the exceedence variable (e.g. POP)
         da_ex = ds[exceedence_var]
 
@@ -102,6 +118,9 @@ def add_random_effect(ds, da_normal, da_uniform=None,
     else:
         mask = None
         r_normal = da_normal.sel(time=slice(t0, t1))
+        if force_load:
+            print('loading normal data')
+            r_normal = r_normal.load()
 
     if root == 1.:
         da_errors = da + (da_errors * r_normal)
@@ -129,7 +148,8 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
                         roots={'pcp': 3., 't_mean': 1, 't_range': 1},
                         rand_vars={'pcp': 'p_rand', 't_mean': 't_rand',
                                    't_range': 't_rand'},
-                        quantile_mapping=False, chunks=None):
+                        quantile_mapping=False, chunks=None,
+                        force_load=False):
 
     '''Top level function for processing raw gard output
 
@@ -188,26 +208,33 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
         rand_ds = xr.open_dataset(rand_ds, chunks=chunks)
 
     ds_out = xr.Dataset()
-    for var in variables:
 
+    if rename_vars is not None:
+        rename_dict = rename_vars.copy()
+
+    for var in variables:
+        exceedence_var = False
         ds_list = []
         for drange in periods:
 
+            drange = _tslice_to_str(drange)
             pre = template.format(se=se, drange=drange, scen=scen)
 
-            ds = xr.open_dataset(pre + '{}.nc'.format(var))
-            ds.merge(xr.open_dataset(pre + '{}_errors.nc'.format(var)),
+            fname = pre + '{}.nc'.format(var)
+            print('opening %s' % fname)
+            ds = xr.open_dataset(fname)
+            fname = pre + '{}_errors.nc'.format(var)
+            ds.merge(xr.open_dataset(fname),
                      inplace=True)
             try:
-                ds.merge(xr.open_dataset(pre + '{}_logistic.nc'.format(var)),
-                         inplace=True)
+                fname = pre + '{}_logistic.nc'.format(var)
+                ds.merge(xr.open_dataset(fname), inplace=True)
+                print('opening %s' % fname)
+                exceedence_var = True
             except (FileNotFoundError, OSError):
                 pass
 
             ds = make_gard_like_obs(ds, obs_ds)
-            if chunks is not None:
-                ds = ds.chunk(chunks=chunks)
-
             units = _get_units_from_drange(drange)
             ds['time'] = nctime_to_nptime(
                 num2date(np.arange(0, ds.dims['time']),
@@ -215,25 +242,37 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
 
             ds_list.append(ds)
         ds = xr.concat(ds_list, dim='time')
+        if force_load:
+            print('loading prediction data')
+            ds = ds.load()
+        elif chunks is not None:
+            ds = ds.chunk(chunks=chunks)
 
         if rename_vars is not None and var in rename_vars:
-            rename_dict = rename_vars.copy()
+            rename_dict = {}
+            rename_dict[var] = rename_vars[var]
             ervar = '{}_error'.format(rename_vars[var])
             rename_dict['{}_error'.format(var)] = ervar
-            exvar = '{}_exceedence_probability'.format(rename_vars[var])
-            rename_dict['{}_exceedence_probability'.format(var)] = exvar
+            if exceedence_var:
+                exvar = '{}_exceedence_probability'.format(rename_vars[var])
+                rename_dict['{}_exceedence_probability'.format(var)] = exvar
             ds = ds.rename(rename_dict)
-            var = rename_vars[var]
+            var = rename_dict[var]
 
         assert var in attrs
         assert var in encoding
 
-        if se is not 'pass_through':
+        t0 = str(ds.coords['time'].data[0])
+        t1 = str(ds.coords['time'].data[-1])
+        rand_ds = rand_ds.sel(time=slice(t0, t1))
+
+        if se != 'pass_through':
             root = roots[var]
             rand_var = rand_vars[var]
             da_errors = add_random_effect(ds, rand_ds[rand_var],
                                           rand_ds['p_rand_uniform'],
-                                          var=var, root=root)
+                                          var=var, root=root,
+                                          force_load=force_load)
         else:
             da_errors = ds[var]
 
@@ -254,7 +293,10 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
             else:
                 grouper = quantile_mapping
             # Quantile mapping
-            da_errors = quantile_mapping_by_group(da_errors, obs_ds[var],
+            if force_load:
+                print('loading obs variable %s' % var)
+                obs_var = obs_ds[var].load()
+            da_errors = quantile_mapping_by_group(da_errors, obs_var,
                                                   mask=obs_mask,
                                                   grouper=grouper)
         ds_out[var] = da_errors
@@ -271,44 +313,136 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
     # mask sure the dataset is properly masked
     if obs_mask is not None:
         ds_out = ds_out.where(obs_mask)
+        ds_out['mask'] = obs_mask
 
     # Add metadata
     ds_out['time'].encoding['calendar'] = calendar
     ds_out['time'].encoding['units'] = units
+    ds_out['time'].encoding['dtype'] = 'f8'
 
     return ds_out
 
 
-def command_line_tool():
+def main():
+
+    # Not sure why I need this...
+    argparse.ArgumentParser.prog = 'junk'
+    argparse.ArgumentParser.usage = 'junk'
+    argparse.ArgumentParser.formatter_class = 'junk'
+    argparse.ArgumentParser.add_help = 'junk'
+    # end funny stuff
+
     parser = argparse.ArgumentParser(
+        prog='post_process_gard_output',
         description='Post Process GARD output')
     parser.add_argument('config_file', metavar='config_file',
                         help='configuration file for downscaling matrix')
-    parser.add_argument('--outdir', metavar='outdir', default=None,
-                        help='output directory for post processed files')
+    parser.add_argument('--force_load', action='store_true')
+    parser.add_argument('--sets', type=str, nargs='+', default=None)
+    parser.add_argument('--vars', type=str, nargs='+', default=None)
     args = parser.parse_args()
 
-    config = read_config(args.config_file)
+    run(args.config_file, sets=args.sets, variables=args.vars,
+        force_load=args.force_load)
 
-    # move logic from notebook here
 
-# drange = '{}-{}'.format(periods[0].split('-')[0],
-#                         periods[-1].split('-')[1])
-# pre = out_template.format(se=se, drange=drange, scen=scen)
-# mm_fname_out = pre + 'mm.nc'
-# dm_fname_out = pre + 'dm.nc'
-#
-# print(dm_fname_out)
-#
-# ds_out.resample('MS', dim='time', how='mean',
-#                 keep_attrs=True).to_netcdf(mm_fname_out, encoding=encoding,
-#                                            unlimited_dims=['time'])
-#
-# ds_out.to_netcdf(dm_fname_out, encoding=encoding, unlimited_dims=['time'])
+def run(config_file, sets=None, variables=None, force_load=False):
 
-    print(config)
+    config = read_config(config_file)
+
+    # Define variables from configuration file
+    if variables is None:
+        variables = list_like(config['PostProc']['variables'])
+    roots = config['PostProc']['roots']
+    rand_vars = config['PostProc']['rand_vars']
+    rename_vars = config['PostProc']['rename_vars']
+    rand_file = config['PostProc']['rand_file']
+
+    if force_load:
+        chunks = None
+    else:
+        chunks = config['PostProc'].get('chunks', None)
+
+    # create directories if they don't exist yet
+    data_dir = config['Options']['DataDir']
+    processed_dir = os.path.join(data_dir, 'post_processed')
+    for d in [data_dir, processed_dir]:
+        os.makedirs(d, exist_ok=True)
+
+    chunk_years = relativedelta(years=int(config['Options']['ChunkYears']))
+
+    # Get obs dataset
+    print('opening %s' % config['Obs_Dataset']['ObsInputPattern'])
+    obs_ds = xr.open_dataset(config['Obs_Dataset']['ObsInputPattern'],
+                             chunks=chunks)
+    obs_mask = (obs_ds['pcp'].isel(time=0, drop=True) >= 0)
+
+    for dataset, dset_config in config['Datasets'].items():
+
+        if sets is None:
+            run_sets = list_like(dset_config['RunSets'])
+        else:
+            run_sets = sets
+
+        gcms = list_like(dset_config['GCMs'])
+        if isinstance(gcms[0], int):
+            # work around for these being cast as ints
+            gcms = ['{0:03}'.format(i) for i in gcms]
+
+        for gcm, setname in itertools.product(gcms, run_sets):
+
+            calendar = config['Calendars'].get(
+                gcm, config['Calendars'].get('all', 'standard'))
+
+            for scen, drange in dset_config['scenario'].items():
+
+                # Get random dataset
+                print('opening %s' % rand_file)
+                rand_ds = xr.open_dataset(rand_file, chunks=chunks)
+                units = _get_units_from_drange(drange[0])
+                rand_ds['time'] = nctime_to_nptime(
+                    num2date(np.arange(0, rand_ds.dims['time']), units,
+                             calendar=calendar))
+
+                template = os.path.join(
+                    data_dir, dataset,
+                    '{se}/{drange}/gard_output.{se}.%s.%s.{scen}.{drange}.' %
+                    (dataset, gcm))
+
+                out_template = os.path.join(
+                    processed_dir,
+                    'gard_output.{se}.%s.%s.{scen}.{drange}.' % (dataset, gcm))
+
+                periods = get_drange_chunks(tuple(drange),
+                                            max_chunk_size=chunk_years)
+
+                ds_out = process_gard_output(
+                    setname, scen, periods, obs_ds, rand_ds,
+                    template=template,
+                    obs_mask=obs_mask,
+                    calendar=calendar,
+                    variables=variables,
+                    rename_vars=rename_vars,
+                    roots=roots,
+                    rand_vars=rand_vars,
+                    quantile_mapping=False,
+                    chunks=chunks,
+                    force_load=force_load)
+
+                drange = '{}-{}'.format(periods[0][0].strftime('%Y%m%d'),
+                                        periods[-1][1].strftime('%Y%m%d'))
+                pre = out_template.format(se=setname, drange=drange, scen=scen)
+                mm_fname_out = pre + 'mm.nc'
+                dm_fname_out = pre + 'dm.nc'
+
+                print(pre)
+                ds_out = ds_out.compute()
+                ds_out.to_netcdf(dm_fname_out, unlimited_dims=['time'])
+                ds_out.resample('MS', dim='time', how='mean',
+                                keep_attrs=True).to_netcdf(
+                    mm_fname_out, unlimited_dims=['time'])
 
 
 if __name__ == '__main__':
     print('post_process_gard_output')
-    command_line_tool()
+    main()

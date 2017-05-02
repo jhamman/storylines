@@ -194,14 +194,14 @@ def main():
     pp.pprint(config)
 
     # Define variables from configuration file
-    # cores = config['Options']['Cores']
 
     # create directories if they don't exist yet
     data_dir = config['Options']['DataDir']
     filelist_dir = os.path.join(data_dir, 'gard_filelists')
     namelist_dir = os.path.join(data_dir, 'gard_namelists')
-    [os.makedirs(d, exist_ok=True) for d in
-        [data_dir, filelist_dir, namelist_dir]]
+    for d in [data_dir, filelist_dir, namelist_dir]:
+        os.makedirs(d, exist_ok=True)
+
     # if outfile is default, put in data_dir
     if outfile == 'namelist.txt':
         outfile = os.path.join(data_dir, outfile)
