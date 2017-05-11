@@ -172,23 +172,26 @@ def make_x0(n_obs, n_in, alpha, beta, extrapolate):
         if extrapolate == 'both':
             x0 = np.empty(n_obs + 2)
             rs = slice(1, -1)
+            x0[rs] = temp
             x0[0] = 0.
             x0[-1] = 1.
         elif extrapolate == 'min':
             x0 = np.empty(n_obs + 1)
             rs = slice(1, None)
+            x0[rs] = temp
             x0[0] = 0.
         elif extrapolate == 'max':
             x0 = np.empty(n_obs + 1)
             rs = slice(None, -1)
-            x0[1] = 1.
+            x0[rs] = temp
+            x0[-1] = 1.
         else:
             raise ValueError('unknown value for extrapolate: %s' % extrapolate)
     else:
         x0 = np.empty(n_obs)
         rs = slice(None)
         extrapolate = False
-    x0[rs] = temp
+        x0 = temp
 
     return x0, rs
 
