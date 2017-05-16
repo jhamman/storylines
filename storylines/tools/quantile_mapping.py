@@ -51,8 +51,11 @@ def quantile_mapping(input_data, ref_data, data_to_match, mask=None,
     '''
 
     assert input_data.get_axis_num('time') == 0
+    assert ref_data.get_axis_num('time') == 0
     assert data_to_match.get_axis_num('time') == 0
-    assert input_data.shape[1:] == data_to_match.shape[1:]
+    shape = input_data.shape[1:]
+    assert shape == ref_data.shape[1:]
+    assert shape == data_to_match.shape[1:]
 
     # Make mask if mask is one was not provided
     if mask is None:
@@ -61,6 +64,8 @@ def quantile_mapping(input_data, ref_data, data_to_match, mask=None,
                             coords=d0.coords)
     else:
         d0 = mask
+
+    chunks = d0.chunks
 
     # keyword args to qmap
     kwargs = dict(alpha=alpha, beta=beta, extrapolate=extrapolate,
@@ -71,9 +76,11 @@ def quantile_mapping(input_data, ref_data, data_to_match, mask=None,
 
     if isinstance(input_data.data, da.Array):
         # dask arrays
-        mask = mask.chunk(d0.chunks)
+        mask = mask.chunk(chunks)
 
-        assert input_data.data.chunks[1:] == data_to_match.data.chunks[1:]
+        assert chunks == input_data.data.chunks[1:]
+        assert chunks == ref_data.data.chunks[1:]
+        assert chunks == data_to_match.data.chunks[1:]
 
         new = da.map_blocks(_qmap_wrapper, input_data.data, ref_data.data,
                             data_to_match.data, mask.data,
@@ -137,7 +144,7 @@ def quantile_mapping_by_group(input_data, ref_data, data_to_match,
     # Iterate over the groups, calling the quantile method function on each
     results = []
     for (key_obs, group_obs), (key_ref, group_ref), (key_input, group_input) \
-        in zip(obs_groups, ref_groups, input_groups):
+            in zip(obs_groups, ref_groups, input_groups):
         results.append(quantile_mapping(group_input, group_obs, **kwargs))
 
     # put the groups back together
