@@ -149,7 +149,8 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
                         rand_vars={'pcp': 'p_rand', 't_mean': 't_rand',
                                    't_range': 't_rand'},
                         quantile_mapping=False, chunks=None,
-                        force_load=False):
+                        force_load=False,
+                        skip_missing=False):
 
     '''Top level function for processing raw gard output
 
@@ -195,7 +196,7 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
     make_gard_like_obs
     quantile_mapping_by_group
     '''
-
+    skip_missing = True
     if not isinstance(obs_ds, xr.Dataset):
         # we'll assume that obs_ds is a string/path/or something that
         # xr.open_dataset can open, if not, we'll raise an error right away
@@ -221,6 +222,9 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
             pre = template.format(se=se, drange=drange, scen=scen)
 
             fname = pre + '{}.nc'.format(var)
+            if skip_missing and not os.path.isfile(fname):
+                print('skipping because %s is missing' % fname)
+                return None
             print('opening %s' % fname)
             ds = xr.open_dataset(fname)
             fname = pre + '{}_errors.nc'.format(var)
@@ -340,13 +344,15 @@ def main():
     parser.add_argument('--force_load', action='store_true')
     parser.add_argument('--sets', type=str, nargs='+', default=None)
     parser.add_argument('--vars', type=str, nargs='+', default=None)
+    parser.add_argument('--skip_missing', action='store_true')
     args = parser.parse_args()
 
     run(args.config_file, sets=args.sets, variables=args.vars,
-        force_load=args.force_load)
+        force_load=args.force_load, skip_missing=args.skip_missing)
 
 
-def run(config_file, sets=None, variables=None, force_load=False):
+def run(config_file, sets=None, variables=None, force_load=False,
+        skip_missing=False):
 
     config = read_config(config_file)
 
@@ -427,11 +433,16 @@ def run(config_file, sets=None, variables=None, force_load=False):
                     rand_vars=rand_vars,
                     quantile_mapping=False,
                     chunks=chunks,
-                    force_load=force_load)
+                    force_load=force_load,
+                    skip_missing=skip_missing)
+
+                if ds_out is None:
+                    continue
 
                 drange = '{}-{}'.format(periods[0][0].strftime('%Y%m%d'),
                                         periods[-1][1].strftime('%Y%m%d'))
-                pre = out_template.format(se=setname, drange=drange, scen=scen)
+                pre = out_template.format(se=setname, drange=drange,
+                                          scen=scen)
                 mm_fname_out = pre + 'mm.nc'
                 dm_fname_out = pre + 'dm.nc'
 

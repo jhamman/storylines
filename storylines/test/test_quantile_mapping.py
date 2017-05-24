@@ -124,12 +124,12 @@ def test_make_x_and_y():
     for ex in [None, 'min', 'max', 'both']:
         y = np.arange(n)
         x, y, s = make_x_and_y(y, 0.4, 0.4, ex)
-        assert len(x) == len(y)
-        assert np.all(np.diff(x) > 0)  # monotonically increasing
+        assert len(x) == len(y) == n + 2
+        assert np.all(np.diff(x) >= 0)  # monotonically increasing
 
     # More input data than obs
-    for ex, add in [(None, 0), ('min', 1), ('max', 1), ('both', 2)]:
+    for ex, add in [(None, 2), ('min', 2), ('max', 2), ('both', 2)]:
         y = np.arange(n)
         x, y, s = make_x_and_y(y, 0.4, 0.4, ex)
         assert len(x) == n + add
-        assert np.all(np.diff(x) > 0)  # monotonically increasing
+        assert np.all(np.diff(x) >= 0)  # monotonically increasing

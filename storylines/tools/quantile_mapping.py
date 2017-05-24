@@ -1,8 +1,14 @@
+#!/usr/bin/env python
 import numpy as np
 from scipy import stats
 
+import argparse
+
 import dask.array as da
 import xarray as xr
+
+SYNTHETIC_MIN = -1e20
+SYNTHETIC_MAX = 1e20
 
 
 def quantile_mapping(input_data, ref_data, data_to_match, mask=None,
@@ -72,7 +78,9 @@ def quantile_mapping(input_data, ref_data, data_to_match, mask=None,
                   n_endpoints=n_endpoints, detrend=detrend)
 
     if ref_data is input_data:
-        ref_data = None
+        use_ref_data = False
+    else:
+        use_ref_data = True
 
     if isinstance(input_data.data, da.Array):
         # dask arrays
@@ -86,11 +94,11 @@ def quantile_mapping(input_data, ref_data, data_to_match, mask=None,
                             data_to_match.data, mask.data,
                             dtype=input_data.data.dtype,
                             chunks=input_data.data.chunks,
-                            name='qmap', **kwargs)
+                            name='qmap', use_ref_data=use_ref_data, **kwargs)
     else:
         # numpy arrays
         new = _qmap_wrapper(input_data.data, ref_data.data, data_to_match.data,
-                            mask.data, **kwargs)
+                            mask.data, use_ref_data=use_ref_data, **kwargs)
 
     return xr.DataArray(new, dims=input_data.dims, coords=input_data.coords,
                         attrs=input_data.attrs,
@@ -180,55 +188,72 @@ def plotting_positions(n, alpha=0.4, beta=0.4):
     return (np.arange(1, n + 1) - alpha) / (n + 1. - alpha - beta)
 
 
-def make_x_and_y(y, alpha, beta, extrapolate):
+def make_x_and_y(y, alpha, beta, extrapolate,
+                 x_min=SYNTHETIC_MIN, x_max=SYNTHETIC_MAX):
     '''helper function to calculate x0, conditionally adding endpoints'''
     n = len(y)
 
     temp = plotting_positions(n, alpha, beta)
 
-    if extrapolate is not None:
-        # Add endpoints to x0
-        if extrapolate == 'both':
-            x = np.empty(n + 2)
-            y_new = np.full(n + 2, np.nan)
-            rs = slice(1, -1)
-            x[rs] = temp
-            x[0] = 0.
-            x[-1] = 1.
-        elif extrapolate == 'min':
-            x = np.empty(n + 1)
-            y_new = np.full(n + 1, np.nan)
-            rs = slice(1, None)
-            x[rs] = temp
-            x[0] = 0.
-        elif extrapolate == 'max':
-            x = np.empty(n + 1)
-            y_new = np.full(n + 1, np.nan)
-            rs = slice(None, -1)
-            x[rs] = temp
-            x[-1] = 1.
-        else:
-            raise ValueError('unknown value for extrapolate: %s' % extrapolate)
-        # move the values from y to the new y array
-        y_new[rs] = y
+    x = np.empty(n + 2)
+    y_new = np.full(n + 2, np.nan)
+    rs = slice(1, -1)
+    x[rs] = temp
+
+    # move the values from y to the new y array
+    # repeat the first/last values to make everything consistant
+    y_new[rs] = y
+    y_new[0] = y[0]
+    y_new[-1] = y[-1]
+
+    # Add endpoints to x0
+    if extrapolate is None:
+        x[0] = temp[0]
+        x[-1] = temp[-1]
+    elif extrapolate == 'both':
+        x[0] = x_min
+        x[-1] = x_max
+    elif extrapolate == 'max':
+        x[0] = temp[0]
+        x[-1] = x_max
+    elif extrapolate == 'min':
+        x[0] = x_min
+        x[-1] = temp[-1]
     else:
-        rs = slice(None)
-        extrapolate = False
-        x = temp
-        y_new = y
+        raise ValueError('unknown value for extrapolate: %s' % extrapolate)
 
     return x, y_new, rs
 
 
-def _extrapolate(y, alpha, beta, n_endpoints, how='both', ret_slice=False):
+def _extrapolate(y, alpha, beta, n_endpoints, how='both', ret_slice=False,
+                 x_min=SYNTHETIC_MIN, x_max=SYNTHETIC_MAX):
 
-    x_new, y_new, rs = make_x_and_y(y, alpha, beta, extrapolate=how)
+    x_new, y_new, rs = make_x_and_y(y, alpha, beta,
+                                    extrapolate=how, x_min=x_min, x_max=x_max)
     y_new = calc_endpoints(x_new, y_new, how, n_endpoints)
 
     if ret_slice:
         return x_new, y_new, rs
     else:
         return x_new, y_new
+
+
+def _custom_extrapolate_x_data(x, y, n_endpoints):
+    lower_inds = np.nonzero(-np.inf == x)[0]
+    upper_inds = np.nonzero(np.inf == x)[0]
+    if len(lower_inds):
+        s = slice(lower_inds[-1] + 1, lower_inds[-1] + 1 + n_endpoints)
+        assert len(x[s]) == n_endpoints
+        assert not np.isinf(x[s]).any()
+        slope, intercept, _, _, _ = stats.linregress(x[s], y[s])
+        x[lower_inds] = (y[lower_inds] - intercept) / slope
+    if len(upper_inds):
+        s = slice(upper_inds[0] - n_endpoints, upper_inds[0])
+        slope, intercept, _, _, _ = stats.linregress(x[s], y[s])
+        assert len(x[s]) == n_endpoints
+        assert not np.isinf(x[s]).any()
+        x[upper_inds] = (y[upper_inds] - intercept) / slope
+    return x
 
 
 def calc_endpoints(x, y, extrapolate, n_endpoints):
@@ -239,8 +264,6 @@ def calc_endpoints(x, y, extrapolate, n_endpoints):
 
     if n_endpoints < 2:
         raise ValueError('Invalid number of n_endpoints, must be >= 2')
-
-
 
     if extrapolate in ['min', 'both']:
         s = slice(1, n_endpoints + 1)
@@ -276,30 +299,46 @@ def qmap(data, ref, like, alpha=0.4, beta=0.4,
          extrapolate=None, n_endpoints=10, detrend=None):
     '''quantile mapping for a single point'''
 
+    inplace = False
+
     if detrend:
         # remove linear trend, saving the slope/intercepts for use later
-        data, data_trend = remove_trend(data, inplace=True)
-        ref, _ = remove_trend(ref, inplace=True)
-        like, _ = remove_trend(like, inplace=True)
+        data, data_trend = remove_trend(data, inplace=inplace)
+        like, _ = remove_trend(like, inplace=inplace)
 
     # x is the percentiles
     # y is the sorted data
     sort_inds = np.argsort(data)
     x_data, y_data, rs = _extrapolate(data[sort_inds], alpha, beta,
                                       n_endpoints,
-                                      how=extrapolate, ret_slice=True)
-    x_ref, y_ref = _extrapolate(np.sort(ref), alpha, beta, n_endpoints,
-                                how=extrapolate)
+                                      how=extrapolate, ret_slice=True,
+                                      x_min=0, x_max=1)
+
     x_like, y_like = _extrapolate(np.sort(like), alpha, beta,
-                                  n_endpoints, how=extrapolate)
+                                  n_endpoints, how=extrapolate,
+                                  x_min=-1e15, x_max=1e15)
 
     # map the quantiles from ref-->data
-    x_data = np.interp(y_data, y_ref, x_ref)
+    # TODO: move to its own function
+    if ref is not False:
+        if detrend:
+            ref, _ = remove_trend(ref, inplace=inplace)
+
+        x_ref, y_ref = _extrapolate(np.sort(ref), alpha, beta, n_endpoints,
+                                    how=extrapolate, x_min=-1e10, x_max=1e10)
+
+        left = -np.inf if extrapolate in ['min', 'both'] else None
+        right = np.inf if extrapolate in ['max', 'both'] else None
+        x_data = np.interp(y_data, y_ref, x_ref, left=left, right=right)
+
+    if np.isinf(x_data).any():
+        # Extrapolate the tails beyond 1.0 to handle "new extremes"
+        x_data = _custom_extrapolate_x_data(x_data, y_data, n_endpoints)
 
     # empty array, prefilled with nans
     new = np.full_like(data, np.nan)
 
-    # Indicies that would sort the input data
+    # Do the final mapping
     new[sort_inds] = np.interp(x_data, x_like, y_like)
 
     # put the trend back
@@ -312,7 +351,66 @@ def qmap(data, ref, like, alpha=0.4, beta=0.4,
 def _qmap_wrapper(data, ref, like, mask, **kwargs):
     new = np.full_like(data, np.nan)
     ii, jj = np.nonzero(mask)
-    for i, j in zip(ii, jj):
-        new[:, i, j] = qmap(data[:, i, j], ref[:, i, j], like[:, i, j],
-                            **kwargs)
+    if kwargs.get('use_ref_data', True):
+        for i, j in zip(ii, jj):
+            new[:, i, j] = qmap(data[:, i, j], ref[:, i, j], like[:, i, j],
+                                **kwargs)
+    else:
+        for i, j in zip(ii, jj):
+            new[:, i, j] = qmap(data[:, i, j], False, like[:, i, j],
+                                **kwargs)
+
     return new
+
+
+def main():
+    """
+    Generate high-resolution meteorologic forcings by downscaling the GCM
+    and/or RCM using the Generalized Analog Regression Downscaling (GARD) tool.
+
+    Inputs:
+    Configuration file formatted with the following options:
+    TODO: Add sample config
+    """
+    # Define usage and set command line arguments
+    parser = argparse.ArgumentParser(
+        description='Downscale ensemble forcings')
+    parser.add_argument('ref', help='reference data file')
+    parser.add_argument('data', help='data file')
+    args = parser.parse_args()
+
+    n_mems = 5
+
+    chunks = {'lat': 56, 'lon': 58, 'time': 1e20}
+    variables = ['pcp', 't_mean', 't_range']
+    detrend = {'pcp': False, 't_mean': True, 't_range': True}
+    extrapolate = {'pcp': 'max', 't_mean': 'both', 't_range': 'max'}
+
+    obs_files = ['/glade/u/home/jhamman/workdir/GARD_inputs/newman_ensemble/conus_ens_00%d.nc' % i for i in range(1, n_mems+1)]
+    obs = xr.open_mfdataset(obs_files[0], chunks=chunks,
+                            decode_times=False, concat_dim='time')
+
+    ref = xr.open_dataset(args.ref, chunks=chunks)
+    data = xr.open_dataset(args.data, chunks=chunks)
+
+    ref['t_mean'] = (ref['t_min'] + ref['t_max']) / 2
+    data['t_mean'] = (data['t_min'] + data['t_max']) / 2
+
+    qm_ds = xr.Dataset()
+    for var in variables:
+        print(var, flush=True)
+        qm_ds[var] = quantile_mapping_by_group(
+            data[var], ref[var], obs[var],
+            grouper=None,
+            detrend=detrend[var],
+            extrapolate=extrapolate[var]).load()
+
+    qm_ds['tmax'] = qm_ds['t_mean'] + 0.5 * qm_ds['t_range']
+    qm_ds['tmin'] = qm_ds['t_mean'] - 0.5 * qm_ds['t_range']
+
+    new_fname = args.data[:-3] + '.qm.nc'
+    qm_ds.to_netcdf(new_fname)
+
+
+if __name__ == "__main__":
+    main()
