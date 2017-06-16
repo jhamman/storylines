@@ -295,8 +295,8 @@ def remove_trend(y, inplace=False):
     return detrended, trend
 
 
-def qmap(data, ref, like, alpha=0.4, beta=0.4,
-         extrapolate=None, n_endpoints=10, detrend=None):
+def qmap(data, ref, like, alpha=0.4, beta=0.4, extrapolate=None,
+         n_endpoints=10, detrend=None, use_ref_data=True):
     '''quantile mapping for a single point'''
 
     inplace = False
@@ -320,7 +320,7 @@ def qmap(data, ref, like, alpha=0.4, beta=0.4,
 
     # map the quantiles from ref-->data
     # TODO: move to its own function
-    if ref is not False:
+    if use_ref_data and ref is not False:
         if detrend:
             ref, _ = remove_trend(ref, inplace=inplace)
 
@@ -375,40 +375,68 @@ def main():
     # Define usage and set command line arguments
     parser = argparse.ArgumentParser(
         description='Downscale ensemble forcings')
-    parser.add_argument('ref', help='reference data file')
     parser.add_argument('data', help='data file')
+    parser.add_argument('--ref', help='reference data file', default=False)
     args = parser.parse_args()
 
     n_mems = 5
 
-    chunks = {'lat': 56, 'lon': 58, 'time': 1e20}
+    # chunks = {'lat': 56, 'lon': 58, 'time': 1e20}
+    chunks = {}
     variables = ['pcp', 't_mean', 't_range']
     detrend = {'pcp': False, 't_mean': True, 't_range': True}
     extrapolate = {'pcp': 'max', 't_mean': 'both', 't_range': 'max'}
+    zeros = {'pcp': True, 't_mean': False, 't_range': False}
 
     obs_files = ['/glade/u/home/jhamman/workdir/GARD_inputs/newman_ensemble/conus_ens_00%d.nc' % i for i in range(1, n_mems+1)]
-    obs = xr.open_mfdataset(obs_files[0], chunks=chunks,
+    print('opening obs files %s' % obs_files)
+    obs = xr.open_mfdataset(obs_files, chunks=chunks,
                             decode_times=False, concat_dim='time')
 
-    ref = xr.open_dataset(args.ref, chunks=chunks)
+    print('opening data file %s' % args.data)
     data = xr.open_dataset(args.data, chunks=chunks)
+    if 't_mean' not in data:
+        data['t_mean'] = (data['t_min'] + data['t_max']) / 2
 
-    ref['t_mean'] = (ref['t_min'] + ref['t_max']) / 2
-    data['t_mean'] = (data['t_min'] + data['t_max']) / 2
+    if args.ref == 'auto':
+        template = 'gard_output.{gset}.{dset}.{gcm}.{scen}.{date_range}.dm.nc'
+        _, gset, dset, gcm, scen, drange, step, _ = args.data.split('.')
+
+        ref_time = {'NCAR_WRF_50km': '19510101-20051231',
+                    'NCAR_WRF_50km_reanalysis': '19790101-20151231'}
+
+        ref = template.format(gset=gset, dset=dset, gcm=gcm,
+                              scen='hist', date_range=ref_time[dset])
+
+    if ref and ref != args.data:
+        print('opening ref file %s' % args.ref)
+        ref = xr.open_dataset(args.ref, chunks=chunks)
+        if 't_mean' not in ref:
+            ref['t_mean'] = (ref['t_min'] + ref['t_max']) / 2
+    else:
+        print('skipping reference data')
+        ref = data
 
     qm_ds = xr.Dataset()
     for var in variables:
         print(var, flush=True)
         qm_ds[var] = quantile_mapping_by_group(
-            data[var], ref[var], obs[var],
+            data[var].load(), ref[var].load(), obs[var].load(),
             grouper=None,
             detrend=detrend[var],
-            extrapolate=extrapolate[var]).load()
+            extrapolate=extrapolate[var])
+
+        if zeros[var]:
+            # make sure a zero in the input data comes out as a zero
+            qm_ds[var].values = np.where(data[var].values == 0,
+                                         0, qm_ds[var].values)
 
     qm_ds['tmax'] = qm_ds['t_mean'] + 0.5 * qm_ds['t_range']
     qm_ds['tmin'] = qm_ds['t_mean'] - 0.5 * qm_ds['t_range']
 
     new_fname = args.data[:-3] + '.qm.nc'
+
+    print('writing output file %s' % new_fname)
     qm_ds.to_netcdf(new_fname)
 
 
