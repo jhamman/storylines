@@ -2,6 +2,7 @@
 import numpy as np
 from scipy import stats
 
+import os
 import argparse
 
 import dask.array as da
@@ -9,6 +10,14 @@ import xarray as xr
 
 SYNTHETIC_MIN = -1e20
 SYNTHETIC_MAX = 1e20
+
+variables = ['pcp', 't_mean', 't_range']
+detrend = {'pcp': False, 't_mean': True, 't_range': True}
+extrapolate = {'pcp': 'max', 't_mean': 'both', 't_range': 'max'}
+zeros = {'pcp': True, 't_mean': False, 't_range': False}
+n_mems = 5
+chunks = {}
+obs_files = ['/glade/u/home/jhamman/workdir/GARD_inputs/newman_ensemble/conus_ens_00%d.nc' % i for i in range(1, n_mems+1)]
 
 
 def quantile_mapping(input_data, ref_data, data_to_match, mask=None,
@@ -243,15 +252,14 @@ def _custom_extrapolate_x_data(x, y, n_endpoints):
     upper_inds = np.nonzero(np.inf == x)[0]
     if len(lower_inds):
         s = slice(lower_inds[-1] + 1, lower_inds[-1] + 1 + n_endpoints)
-        assert len(x[s]) == n_endpoints
+        print(s, lower_inds[-1], n_endpoints, x[s])
         assert not np.isinf(x[s]).any()
         slope, intercept, _, _, _ = stats.linregress(x[s], y[s])
         x[lower_inds] = (y[lower_inds] - intercept) / slope
     if len(upper_inds):
         s = slice(upper_inds[0] - n_endpoints, upper_inds[0])
-        slope, intercept, _, _, _ = stats.linregress(x[s], y[s])
-        assert len(x[s]) == n_endpoints
         assert not np.isinf(x[s]).any()
+        slope, intercept, _, _, _ = stats.linregress(x[s], y[s])
         x[upper_inds] = (y[upper_inds] - intercept) / slope
     return x
 
@@ -339,7 +347,7 @@ def qmap(data, ref, like, alpha=0.4, beta=0.4, extrapolate=None,
     new = np.full_like(data, np.nan)
 
     # Do the final mapping
-    new[sort_inds] = np.interp(x_data, x_like, y_like)
+    new[sort_inds] = np.interp(x_data, x_like, y_like)[rs]
 
     # put the trend back
     if detrend:
@@ -377,22 +385,43 @@ def main():
         description='Downscale ensemble forcings')
     parser.add_argument('data', help='data file')
     parser.add_argument('--ref', help='reference data file', default=False)
+    parser.add_argument('--kind', help='input data type', default='gard')
     args = parser.parse_args()
 
-    n_mems = 5
-
-    # chunks = {'lat': 56, 'lon': 58, 'time': 1e20}
-    chunks = {}
-    variables = ['pcp', 't_mean', 't_range']
-    detrend = {'pcp': False, 't_mean': True, 't_range': True}
-    extrapolate = {'pcp': 'max', 't_mean': 'both', 't_range': 'max'}
-    zeros = {'pcp': True, 't_mean': False, 't_range': False}
-
-    obs_files = ['/glade/u/home/jhamman/workdir/GARD_inputs/newman_ensemble/conus_ens_00%d.nc' % i for i in range(1, n_mems+1)]
     print('opening obs files %s' % obs_files)
     obs = xr.open_mfdataset(obs_files, chunks=chunks,
                             decode_times=False, concat_dim='time')
+    mask = obs['elevation'].notnull()
 
+    if args.kind == 'gard':
+        data, ref, new_fname = _gard_func(args, obs, mask)
+    elif args.kind == 'icar':
+        data, ref, new_fname = _icar_func(args, obs, mask)
+
+    qm_ds = xr.Dataset()
+    for var in variables:
+        print(var, flush=True)
+        qm_ds[var] = quantile_mapping_by_group(
+            data[var].load(),
+            ref[var].load(),
+            obs[var].load(),
+            grouper=None,
+            detrend=detrend[var],
+            extrapolate=extrapolate[var])
+
+        if zeros[var]:
+            # make sure a zero in the input data comes out as a zero
+            qm_ds[var].values = np.where(data[var].values == 0,
+                                         0, qm_ds[var].values)
+
+    qm_ds['tmax'] = qm_ds['t_mean'] + 0.5 * qm_ds['t_range']
+    qm_ds['tmin'] = qm_ds['t_mean'] - 0.5 * qm_ds['t_range']
+
+    print('writing output file %s' % new_fname)
+    qm_ds.to_netcdf(new_fname)
+
+
+def _gard_func(args, obs, mask):
     print('opening data file %s' % args.data)
     data = xr.open_dataset(args.data, chunks=chunks)
     if 't_mean' not in data:
@@ -409,35 +438,48 @@ def main():
                               scen='hist', date_range=ref_time[dset])
 
     if ref and ref != args.data:
-        print('opening ref file %s' % args.ref)
-        ref = xr.open_dataset(args.ref, chunks=chunks)
+        print('opening ref file %s' % ref)
+        ref = xr.open_dataset(ref, chunks=chunks)
         if 't_mean' not in ref:
             ref['t_mean'] = (ref['t_min'] + ref['t_max']) / 2
     else:
         print('skipping reference data')
         ref = data
 
-    qm_ds = xr.Dataset()
-    for var in variables:
-        print(var, flush=True)
-        qm_ds[var] = quantile_mapping_by_group(
-            data[var].load(), ref[var].load(), obs[var].load(),
-            grouper=None,
-            detrend=detrend[var],
-            extrapolate=extrapolate[var])
-
-        if zeros[var]:
-            # make sure a zero in the input data comes out as a zero
-            qm_ds[var].values = np.where(data[var].values == 0,
-                                         0, qm_ds[var].values)
-
-    qm_ds['tmax'] = qm_ds['t_mean'] + 0.5 * qm_ds['t_range']
-    qm_ds['tmin'] = qm_ds['t_mean'] - 0.5 * qm_ds['t_range']
-
     new_fname = args.data[:-3] + '.qm.nc'
 
-    print('writing output file %s' % new_fname)
-    qm_ds.to_netcdf(new_fname)
+    return data, ref, new_fname
+
+
+def _icar_func(args, obs, mask):
+
+    dirname = args.data
+
+    case_name = os.path.split(dirname)[-1]
+    pattern = os.path.join(dirname, 'merged', 'merged_%s_*.nc' % case_name)
+    print(case_name, pattern, flush=True)
+
+    data = xr.open_mfdataset(pattern).rename({'icar_pcp': 'pcp',
+                                              'avg_ta2m': 't_mean'})
+
+    data['lon'].data[data['lon'].data > 180] -= 360.
+
+    data['t_range'] = data['max_ta2m'] - data['min_ta2m']
+
+    if 'hist' in case_name:
+        ref = data
+    else:
+        suf = case_name.split('_')[1]
+        ref_pattern = pattern.replace(suf, 'hist')
+        print('  ref->', ref_pattern, flush=True)
+        ref = xr.open_mfdataset(ref_pattern, chunks=chunks).rename(
+            {'icar_pcp': 'pcp', 'avg_ta2m': 't_mean'})
+        ref['lon'].data[ref['lon'].data > 180] -= 360.
+        ref['t_range'] = ref['max_ta2m'] - ref['min_ta2m']
+
+    new_fname = '/glade/u/home/jhamman/workdir/icar_qm/%s.nc' % case_name
+
+    return data, ref, new_fname
 
 
 if __name__ == "__main__":
