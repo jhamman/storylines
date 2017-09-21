@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+import sys
 import numpy as np
 from scipy import stats
 
@@ -8,6 +9,8 @@ import argparse
 import dask.array as da
 import xarray as xr
 
+from storylines.tools.encoding import attrs, encoding, make_gloabl_attrs
+
 SYNTHETIC_MIN = -1e20
 SYNTHETIC_MAX = 1e20
 
@@ -15,14 +18,14 @@ variables = ['pcp', 't_mean', 't_range']
 detrend = {'pcp': False, 't_mean': True, 't_range': True}
 extrapolate = {'pcp': 'max', 't_mean': 'both', 't_range': 'max'}
 zeros = {'pcp': True, 't_mean': False, 't_range': False}
-n_mems = 5
+
 chunks = {}
-obs_files = ['/glade/u/home/jhamman/workdir/GARD_inputs/newman_ensemble/conus_ens_00%d.nc' % i for i in range(1, n_mems+1)]
 
 
 def quantile_mapping(input_data, ref_data, data_to_match, mask=None,
                      alpha=0.4, beta=0.4, detrend=False,
-                     extrapolate=None, n_endpoints=10):
+                     extrapolate=None, n_endpoints=10,
+                     use_ref_data=True):
     '''quantile mapping between `input_data` and `data_to_match`
 
     Parameters
@@ -66,11 +69,15 @@ def quantile_mapping(input_data, ref_data, data_to_match, mask=None,
     '''
 
     assert input_data.get_axis_num('time') == 0
-    assert ref_data.get_axis_num('time') == 0
     assert data_to_match.get_axis_num('time') == 0
     shape = input_data.shape[1:]
-    assert shape == ref_data.shape[1:]
     assert shape == data_to_match.shape[1:]
+
+    if ref_data is not False:
+        assert ref_data.get_axis_num('time') == 0
+        assert shape == ref_data.shape[1:]
+    if use_ref_data and ref_data is False:
+        raise ValueError('cannot use ref_data without ref_data')
 
     # Make mask if mask is one was not provided
     if mask is None:
@@ -86,28 +93,39 @@ def quantile_mapping(input_data, ref_data, data_to_match, mask=None,
     kwargs = dict(alpha=alpha, beta=beta, extrapolate=extrapolate,
                   n_endpoints=n_endpoints, detrend=detrend)
 
-    if ref_data is input_data:
-        use_ref_data = False
-    else:
-        use_ref_data = True
-
     if isinstance(input_data.data, da.Array):
         # dask arrays
         mask = mask.chunk(chunks)
 
         assert chunks == input_data.data.chunks[1:]
-        assert chunks == ref_data.data.chunks[1:]
         assert chunks == data_to_match.data.chunks[1:]
 
-        new = da.map_blocks(_qmap_wrapper, input_data.data, ref_data.data,
-                            data_to_match.data, mask.data,
-                            dtype=input_data.data.dtype,
-                            chunks=input_data.data.chunks,
-                            name='qmap', use_ref_data=use_ref_data, **kwargs)
+        if use_ref_data:
+            assert chunks == ref_data.data.chunks[1:]
+
+            new = da.map_blocks(_qmap_wrapper, input_data.data, ref_data.data,
+                                data_to_match.data, mask.data,
+                                dtype=input_data.data.dtype,
+                                chunks=input_data.data.chunks,
+                                name='qmap', use_ref_data=use_ref_data,
+                                **kwargs)
+        else:
+            new = da.map_blocks(_qmap_wrapper, input_data.data, False,
+                                data_to_match.data, mask.data,
+                                dtype=input_data.data.dtype,
+                                chunks=input_data.data.chunks,
+                                name='qmap', use_ref_data=use_ref_data,
+                                **kwargs)
+
     else:
         # numpy arrays
-        new = _qmap_wrapper(input_data.data, ref_data.data, data_to_match.data,
-                            mask.data, use_ref_data=use_ref_data, **kwargs)
+        if use_ref_data:
+            new = _qmap_wrapper(input_data.data, ref_data.data,
+                                data_to_match.data,
+                                mask.data, use_ref_data=use_ref_data, **kwargs)
+        else:
+            new = _qmap_wrapper(input_data.data, False, data_to_match.data,
+                                mask.data, use_ref_data=use_ref_data, **kwargs)
 
     return xr.DataArray(new, dims=input_data.dims, coords=input_data.coords,
                         attrs=input_data.attrs,
@@ -155,14 +173,21 @@ def quantile_mapping_by_group(input_data, ref_data, data_to_match,
 
     # Create the groupby objects
     obs_groups = data_to_match.groupby(grouper)
-    ref_groups = ref_data.groupby(grouper)
     input_groups = input_data.groupby(grouper)
 
     # Iterate over the groups, calling the quantile method function on each
     results = []
-    for (key_obs, group_obs), (key_ref, group_ref), (key_input, group_input) \
-            in zip(obs_groups, ref_groups, input_groups):
-        results.append(quantile_mapping(group_input, group_obs, **kwargs))
+    if ref_data is not False:
+        ref_groups = ref_data.groupby(grouper)
+        for (key_obs, group_obs), (key_ref, group_ref), (key_input, group_input) \
+                in zip(obs_groups, ref_groups, input_groups):
+            results.append(quantile_mapping(group_input, group_ref, group_obs,
+                                            **kwargs))
+    else:
+        for (key_obs, group_obs), (key_input, group_input) \
+                in zip(obs_groups, input_groups):
+            results.append(quantile_mapping(group_input, False, group_obs,
+                                            **kwargs))
 
     # put the groups back together
     new_concat = xr.concat(results, dim='time')
@@ -216,7 +241,7 @@ def make_x_and_y(y, alpha, beta, extrapolate,
     y_new[-1] = y[-1]
 
     # Add endpoints to x0
-    if extrapolate is None:
+    if (extrapolate is None) or (extrapolate == '1to1'):
         x[0] = temp[0]
         x[-1] = temp[-1]
     elif extrapolate == 'both':
@@ -296,8 +321,8 @@ def remove_trend(y, inplace=False):
         detrended = y.copy()
 
     t = np.arange(len(y))
-    slope, intercept, _, _, _ = stats.linregress(t, y)
-    trend = intercept + t * slope
+    slope = stats.linregress(t, y)[0]  # extract slope only
+    trend = t * slope
     detrended -= trend
 
     return detrended, trend
@@ -349,6 +374,32 @@ def qmap(data, ref, like, alpha=0.4, beta=0.4, extrapolate=None,
     # Do the final mapping
     new[sort_inds] = np.interp(x_data, x_like, y_like)[rs]
 
+    # If extrapolate is 1to1, apply the offset between ref and like to the
+    # tails of new
+    if use_ref_data and (ref is not False) and (extrapolate == '1to1'):
+        ref_max = ref.max()
+        ref_min = ref.min()
+        inds = (data > ref_max)
+        if inds.any():
+            if len(ref) == len(like):
+                new[inds] = like.max() + (data[inds] - ref_max)
+            elif len(ref) > len(like):
+                ref_at_like_max = np.interp(x_like[-1], x_ref, y_ref)
+                new[inds] = like.max() + (data[inds] - ref_at_like_max)
+            elif len(ref) < len(like):
+                like_at_ref_max = np.interp(x_ref[-1], x_like, y_like)
+                new[inds] = like_at_ref_max + (data[inds] - ref_max)
+        inds = (data < ref_min)
+        if inds.any():
+            if len(ref) == len(like):
+                new[inds] = like.min() + (data[inds] - ref_min)
+            elif len(ref) > len(like):
+                ref_at_like_min = np.interp(x_like[0], x_ref, y_ref)
+                new[inds] = like.min() + (data[inds] - ref_at_like_min)
+            elif len(ref) < len(like):
+                like_at_ref_min = np.interp(x_ref[0], x_like, y_like)
+                new[inds] = like_at_ref_min + (data[inds] - ref_min)
+
     # put the trend back
     if detrend:
         new += data_trend
@@ -357,9 +408,10 @@ def qmap(data, ref, like, alpha=0.4, beta=0.4, extrapolate=None,
 
 
 def _qmap_wrapper(data, ref, like, mask, **kwargs):
+
     new = np.full_like(data, np.nan)
     ii, jj = np.nonzero(mask)
-    if kwargs.get('use_ref_data', True):
+    if kwargs.get('use_ref_data', True) and ref is not False:
         for i, j in zip(ii, jj):
             new[:, i, j] = qmap(data[:, i, j], ref[:, i, j], like[:, i, j],
                                 **kwargs)
@@ -383,42 +435,73 @@ def main():
     # Define usage and set command line arguments
     parser = argparse.ArgumentParser(
         description='Downscale ensemble forcings')
-    parser.add_argument('data', help='data file')
+    parser.add_argument('--data', help='data file')
     parser.add_argument('--ref', help='reference data file', default=False)
+    parser.add_argument('--obs_files', nargs='+', help='obs data file(s)',
+                        default=['/glade/u/home/jhamman/workdir/GARD_inputs/newman_ensemble/conus_ens_00%d.nc' % i for i in range(1, 6)])
     parser.add_argument('--kind', help='input data type', default='gard')
+    parser.add_argument('--variables', nargs='+', default=variables,
+                        help='list of variables to quantile map')
+    parser.add_argument('--skip_existing', action='store_true')
     args = parser.parse_args()
 
-    print('opening obs files %s' % obs_files)
-    obs = xr.open_mfdataset(obs_files, chunks=chunks,
+    print('opening obs files %s' % args.obs_files)
+    obs = xr.open_mfdataset(args.obs_files, chunks=chunks,
                             decode_times=False, concat_dim='time')
-    mask = obs['elevation'].notnull()
+    mask = obs['elevation'].notnull().load()
 
     if args.kind == 'gard':
         data, ref, new_fname = _gard_func(args, obs, mask)
     elif args.kind == 'icar':
         data, ref, new_fname = _icar_func(args, obs, mask)
 
+    if args.skip_existing and os.path.isfile(new_fname):
+        print('skipping: output file exists')
+        with open("QM_EXISTING.txt", "a") as f:
+            f.write(new_fname + '\n')
+        return
+
     qm_ds = xr.Dataset()
-    for var in variables:
+    for var in args.variables:
         print(var, flush=True)
-        qm_ds[var] = quantile_mapping_by_group(
+        if ref is not False:
+            ref_da = ref[var].load()
+            use_ref_data = True
+        else:
+            use_ref_data = False
+            ref_da = False
+        qm_ds[var] = quantile_mapping(
             data[var].load(),
-            ref[var].load(),
+            ref_da,
             obs[var].load(),
-            grouper=None,
             detrend=detrend[var],
-            extrapolate=extrapolate[var])
+            extrapolate='1to1',
+            use_ref_data=use_ref_data)  # extrapolate[var])
 
         if zeros[var]:
             # make sure a zero in the input data comes out as a zero
-            qm_ds[var].values = np.where(data[var].values == 0,
+            qm_ds[var].values = np.where(data[var].values <= 0,
                                          0, qm_ds[var].values)
 
-    qm_ds['tmax'] = qm_ds['t_mean'] + 0.5 * qm_ds['t_range']
-    qm_ds['tmin'] = qm_ds['t_mean'] - 0.5 * qm_ds['t_range']
+    if 't_mean' in args.variables and 't_range' in args.variables:
+        qm_ds['t_max'] = qm_ds['t_mean'] + 0.5 * qm_ds['t_range']
+        qm_ds['t_min'] = qm_ds['t_mean'] - 0.5 * qm_ds['t_range']
+
+    use_encoding = {key: encoding[key] for key in qm_ds.data_vars}
+
+    for var in qm_ds.data_vars:
+        try:
+            qm_ds[var].attrs = attrs.get(var, obs[var])
+            qm_ds[var].encoding = use_encoding.get(var, obs[var])
+        except KeyError:
+            print('unable to find attributes for %s' % var)
+            pass
+
+    qm_ds.attrs = make_gloabl_attrs(title='Quantile mapped downscaled dataset')
 
     print('writing output file %s' % new_fname)
-    qm_ds.to_netcdf(new_fname)
+    qm_ds.to_netcdf(new_fname, unlimited_dims=['time'],
+                    format='NETCDF4', encoding=use_encoding)
 
 
 def _gard_func(args, obs, mask):
@@ -437,14 +520,14 @@ def _gard_func(args, obs, mask):
         ref = template.format(gset=gset, dset=dset, gcm=gcm,
                               scen='hist', date_range=ref_time[dset])
 
-    if ref and ref != args.data:
+    if ref is not False and ref != args.data:
         print('opening ref file %s' % ref)
         ref = xr.open_dataset(ref, chunks=chunks)
         if 't_mean' not in ref:
             ref['t_mean'] = (ref['t_min'] + ref['t_max']) / 2
     else:
         print('skipping reference data')
-        ref = data
+        ref = False
 
     new_fname = args.data[:-3] + '.qm.nc'
 
@@ -453,34 +536,52 @@ def _gard_func(args, obs, mask):
 
 def _icar_func(args, obs, mask):
 
-    dirname = args.data
+    if os.path.isfile(args.data):
+        data = xr.open_dataset(args.data).rename({'icar_pcp': 'pcp',
+                                                  'avg_ta2m': 't_mean'})
+        case_name = os.path.basename(args.data)
+        pattern = args.data
+        for scen in ['hist', 'rcp45', 'rcp85']:
+            if scen in case_name:
+                break
+    else:
+        dirname = args.data
+        case_name = os.path.split(dirname)[-1]
+        pattern = os.path.join(dirname, 'merged', 'merged_%s_*.nc' % case_name)
+        print(case_name, pattern, flush=True)
 
-    case_name = os.path.split(dirname)[-1]
-    pattern = os.path.join(dirname, 'merged', 'merged_%s_*.nc' % case_name)
-    print(case_name, pattern, flush=True)
-
-    data = xr.open_mfdataset(pattern).rename({'icar_pcp': 'pcp',
-                                              'avg_ta2m': 't_mean'})
+        data = xr.open_mfdataset(pattern).rename({'icar_pcp': 'pcp',
+                                                  'avg_ta2m': 't_mean'})
+        scen = case_name.split('_')[1]
 
     data['lon'].data[data['lon'].data > 180] -= 360.
 
     data['t_range'] = data['max_ta2m'] - data['min_ta2m']
 
-    if 'hist' in case_name:
-        ref = data
+    if scen == 'hist':
+        ref = False
     else:
-        suf = case_name.split('_')[1]
-        ref_pattern = pattern.replace(suf, 'hist')
+        if args.ref == 'auto':
+            ref_pattern = pattern.replace(scen, 'hist')
+        else:
+            ref_pattern = args.ref
         print('  ref->', ref_pattern, flush=True)
         ref = xr.open_mfdataset(ref_pattern, chunks=chunks).rename(
             {'icar_pcp': 'pcp', 'avg_ta2m': 't_mean'})
         ref['lon'].data[ref['lon'].data > 180] -= 360.
         ref['t_range'] = ref['max_ta2m'] - ref['min_ta2m']
 
-    new_fname = '/glade/u/home/jhamman/workdir/icar_qm/%s.nc' % case_name
+    new_fname = '/glade/u/home/jhamman/workdir/icar_qm/%s' % case_name
 
     return data, ref, new_fname
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except:
+        # write out failed arguments
+        with open("FAILED.txt", "a") as f:
+            line = ' '.join(sys.argv) + '\n'
+            f.write(line)
+        raise

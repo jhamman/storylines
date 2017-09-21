@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+import sys
 import os
 import argparse
 import itertools
@@ -6,6 +7,7 @@ from dateutil.relativedelta import relativedelta
 
 import numpy as np
 import dask
+import dask.multiprocessing
 import xarray as xr
 from scipy.special import cbrt
 from scipy.stats import norm
@@ -15,24 +17,15 @@ from xarray.conventions import nctime_to_nptime
 
 from storylines.tools.gard_utils import (read_config, get_drange_chunks,
                                          list_like, _tslice_to_str)
-from storylines.tools.quantile_mapping import quantile_mapping_by_group
+from storylines.tools.encoding import attrs, encoding, make_gloabl_attrs
 
-attrs = {'pcp': {'units': 'mm', 'long_name': 'precipitation',
-                 'comment': 'random effects applied'},
-         't_mean': {'units': 'C', 'long_name': 'air temperature',
-                    'comment': 'random effects applied'},
-         't_range': {'units': 'C', 'long_name': 'daily air temperature range',
-                     'comment': 'random effects applied'},
-         't_min': {'units': 'C', 'long_name': 'minimum daily air temperature',
-                   'comment': 'random effects applied'},
-         't_max': {'units': 'C', 'long_name': 'maximum daily air temperature',
-                   'comment': 'random effects applied'}}
+# dask.set_options(get=dask.multiprocessing.get, num_workers=16)
 
-encoding = {'pcp': {'_FillValue': -9999},
-            't_mean': {'_FillValue': -9999},
-            't_range': {'_FillValue': -9999},
-            't_min': {'_FillValue': -9999},
-            't_max': {'_FillValue': -9999}}
+PASS_THROUGH_PCP_MULT = 24  # units mm/hr to mm/day
+KELVIN = 273.15
+
+MISSING = []
+EXISTING = []
 
 
 def _get_units_from_drange(d):
@@ -57,6 +50,16 @@ def make_gard_like_obs(ds, obs, mask=None):
         ds = ds.where(mask)
 
     return ds
+
+
+def get_rand_ds(rand_file, chunks=None, calendar=None,
+                units='days since 1950-01-01'):
+    rand_ds = xr.open_dataset(rand_file, chunks=chunks)
+    rand_ds['time'] = nctime_to_nptime(
+        num2date(np.arange(0, rand_ds.dims['time']), units,
+                 calendar=calendar))
+
+    return rand_ds
 
 
 def add_random_effect(ds, da_normal, da_uniform=None,
@@ -148,7 +151,7 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
                         roots={'pcp': 3., 't_mean': 1, 't_range': 1},
                         rand_vars={'pcp': 'p_rand', 't_mean': 't_rand',
                                    't_range': 't_rand'},
-                        quantile_mapping=False, chunks=None,
+                        chunks=None,
                         force_load=False,
                         skip_missing=False):
 
@@ -180,10 +183,6 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
         Dictionary of transform roots
     rand_vars : dict
         Dictionary mapping from ``variables`` to ``rand_ds`` variable names
-    quantile_mapping : boolean or str or array
-        If True, perform quantile mapping over full record. If str or array,
-        perform quantile mapping by group. If False, do not perform any
-        quantile mapping.
 
     Returns
     -------
@@ -194,7 +193,6 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
     --------
     add_random_effect
     make_gard_like_obs
-    quantile_mapping_by_group
     '''
     skip_missing = True
     if not isinstance(obs_ds, xr.Dataset):
@@ -263,9 +261,6 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
             ds = ds.rename(rename_dict)
             var = rename_dict[var]
 
-        assert var in attrs
-        assert var in encoding
-
         t0 = str(ds.coords['time'].data[0])
         t1 = str(ds.coords['time'].data[-1])
         rand_ds = rand_ds.sel(time=slice(t0, t1))
@@ -277,47 +272,30 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
                                           rand_ds['p_rand_uniform'],
                                           var=var, root=root,
                                           force_load=force_load)
+
         else:
-            da_errors = ds[var]
-
-        if quantile_mapping is not False:
-            t0 = str(da_errors.coords['time'].data[0])
-            t1 = str(da_errors.coords['time'].data[-1])
-            # offset zeros in GARD data for precip
-            # TODO: update this with new dask/xarray where
-            if '{}_exceedence_probability'.format(var) in ds:
-                da_errors.data = dask.array.where(
-                    da_errors.data > 0,  # where precip is non-zero
-                    da_errors.data + 1,  # add 1
-                    rand_ds['p_rand_uniform'].sel(time=slice(t0, t1)).data)
-
-            # Unpack the grouper for quantile mapping
-            if quantile_mapping is True:
-                grouper = None
+            if var == 'pcp':
+                da_errors = ds[var] * PASS_THROUGH_PCP_MULT
+            elif var == 't_mean':
+                da_errors = ds[var] - KELVIN
             else:
-                grouper = quantile_mapping
-            # Quantile mapping
-            if force_load:
-                print('loading obs variable %s' % var)
-                obs_var = obs_ds[var].load()
-            da_errors = quantile_mapping_by_group(da_errors, obs_var,
-                                                  mask=obs_mask,
-                                                  grouper=grouper)
-        ds_out[var] = da_errors
-        ds_out[var].attrs = attrs[var]
-        ds_out[var].encoding = encoding[var]
+                da_errors = ds[var]
 
-    if 't_range' in variables and 't_mean' in variables:
-        ds_out['t_min'] = ds_out['t_mean'] - 0.5 * ds_out['t_range']
-        ds_out['t_max'] = ds_out['t_mean'] + 0.5 * ds_out['t_range']
-        for var in ['t_max', 't_min']:
-            ds_out[var].attrs = attrs[var]
-        ds_out = ds_out.drop('t_mean')
+        # QC data after adding random effects
+        if var in ['pcp', 't_range']:
+            da_errors.data = dask.array.where(da_errors.data > 0.,
+                                              da_errors.data, 0)
+
+        ds_out[var] = da_errors
+        ds_out[var].attrs.update(attrs[var])
+        ds_out[var].encoding.update(encoding[var])
 
     # mask sure the dataset is properly masked
     if obs_mask is not None:
         ds_out = ds_out.where(obs_mask)
         ds_out['mask'] = obs_mask
+        ds_out['mask'].attrs = attrs['mask']
+        ds_out['mask'].encoding.update(encoding['mask'])
 
     # Add metadata
     ds_out['time'].encoding['calendar'] = calendar
@@ -343,16 +321,19 @@ def main():
                         help='configuration file for downscaling matrix')
     parser.add_argument('--force_load', action='store_true')
     parser.add_argument('--sets', type=str, nargs='+', default=None)
+    parser.add_argument('--gcms', type=str, nargs='+', default=None)
     parser.add_argument('--vars', type=str, nargs='+', default=None)
     parser.add_argument('--skip_missing', action='store_true')
+    parser.add_argument('--skip_existing', action='store_true')
     args = parser.parse_args()
 
-    run(args.config_file, sets=args.sets, variables=args.vars,
-        force_load=args.force_load, skip_missing=args.skip_missing)
+    run(args.config_file, gcms=args.gcms, sets=args.sets, variables=args.vars,
+        force_load=args.force_load, skip_missing=args.skip_missing,
+        skip_existing=args.skip_existing)
 
 
-def run(config_file, sets=None, variables=None, force_load=False,
-        skip_missing=False):
+def run(config_file, gcms=None, sets=None, variables=None, force_load=False,
+        skip_missing=False, skip_existing=False):
 
     config = read_config(config_file)
 
@@ -389,26 +370,26 @@ def run(config_file, sets=None, variables=None, force_load=False,
             run_sets = list_like(dset_config['RunSets'])
         else:
             run_sets = sets
-
-        gcms = list_like(dset_config['GCMs'])
-        if isinstance(gcms[0], int):
+        if gcms is None:
+            run_gcms = list_like(dset_config['GCMs'])
+        else:
+            # get the intersection of gcms with this dataset's config
+            run_gcms = list_like(set(gcms).intersection(
+                set(list_like(dset_config['GCMs']))))
+            run_gcms = list(run_gcms)
+            if not gcms:
+                print('skipping because this gcm isnt in the dataset config')
+                continue
+        if run_gcms and isinstance(run_gcms[0], int):
             # work around for these being cast as ints
-            gcms = ['{0:03}'.format(i) for i in gcms]
+            run_gcms = ['{0:03}'.format(i) for i in run_gcms]
 
-        for gcm, setname in itertools.product(gcms, run_sets):
+        for gcm, setname in itertools.product(run_gcms, run_sets):
 
             calendar = config['Calendars'].get(
                 gcm, config['Calendars'].get('all', 'standard'))
 
             for scen, drange in dset_config['scenario'].items():
-
-                # Get random dataset
-                print('opening %s' % rand_file)
-                rand_ds = xr.open_dataset(rand_file, chunks=chunks)
-                units = _get_units_from_drange(drange[0])
-                rand_ds['time'] = nctime_to_nptime(
-                    num2date(np.arange(0, rand_ds.dims['time']), units,
-                             calendar=calendar))
 
                 template = os.path.join(
                     data_dir, dataset,
@@ -422,6 +403,22 @@ def run(config_file, sets=None, variables=None, force_load=False,
                 periods = get_drange_chunks(tuple(drange),
                                             max_chunk_size=chunk_years)
 
+                drange = '{}-{}'.format(periods[0][0].strftime('%Y%m%d'),
+                                        periods[-1][1].strftime('%Y%m%d'))
+                pre = out_template.format(se=setname, drange=drange,
+                                          scen=scen)
+                # mm_fname_out = pre + 'mm.nc'
+                dm_fname_out = pre + 'dm.nc'
+
+                if skip_existing and os.path.isfile(dm_fname_out):
+                    EXISTING.append(dm_fname_out + '\n')
+                    continue
+
+                # Get random dataset
+                print('opening %s' % rand_file)
+                rand_ds = get_rand_ds(rand_file, chunks=chunks,
+                                      calendar=calendar)
+
                 ds_out = process_gard_output(
                     setname, scen, periods, obs_ds, rand_ds,
                     template=template,
@@ -431,29 +428,49 @@ def run(config_file, sets=None, variables=None, force_load=False,
                     rename_vars=rename_vars,
                     roots=roots,
                     rand_vars=rand_vars,
-                    quantile_mapping=False,
                     chunks=chunks,
                     force_load=force_load,
                     skip_missing=skip_missing)
 
                 if ds_out is None:
+                    MISSING.append(dm_fname_out + '\n')
                     continue
-
-                drange = '{}-{}'.format(periods[0][0].strftime('%Y%m%d'),
-                                        periods[-1][1].strftime('%Y%m%d'))
-                pre = out_template.format(se=setname, drange=drange,
-                                          scen=scen)
-                mm_fname_out = pre + 'mm.nc'
-                dm_fname_out = pre + 'dm.nc'
 
                 print(pre)
                 ds_out = ds_out.compute()
-                ds_out.to_netcdf(dm_fname_out, unlimited_dims=['time'])
-                ds_out.resample('MS', dim='time', how='mean',
-                                keep_attrs=True).to_netcdf(
-                    mm_fname_out, unlimited_dims=['time'])
+
+                print(ds_out.info())
+                out_encoding = {}
+                for key in ds_out:
+                    try:
+                        out_encoding[key] = encoding[key]
+                    except KeyError:
+                        pass
+                print(out_encoding)
+
+                ds_out.to_netcdf(dm_fname_out, unlimited_dims=['time'],
+                                 format='NETCDF4', encoding=out_encoding)
+                ds_out.attrs = make_gloabl_attrs(
+                    title='Post-processed GARD output downscaled dataset')
 
 
 if __name__ == '__main__':
     print('post_process_gard_output')
-    main()
+    try:
+        main()
+    except:
+        # write out failed arguments
+        with open("FAILED.txt", "a") as f:
+            line = ' '.join(sys.argv) + '\n'
+            f.write(line)
+        raise
+
+    print('complete')
+    # write out cases flagged as missing
+    with open("MISSING.txt", "a") as f:
+        f.writelines(MISSING)
+    # write out cases flagged as existing
+    with open("EXISTING.txt", "a") as f:
+        f.writelines(EXISTING)
+    print('EXISTING: %s' % ', '.join(EXISTING))
+    print('MISSING: %s' % ', '.join(MISSING))
