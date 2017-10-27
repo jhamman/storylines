@@ -120,7 +120,7 @@ TRANSFORM = {'TMP_2maboveground': NO_TRANSFORM,
              'T_RANGE': NO_TRANSFORM,
              't_range': NO_TRANSFORM,
              'PREC_TOT': p_transform,
-			 'rain_rate': p_transform,
+             'rain_rate': p_transform,
              }
 
 TRAINVARMAP = {'TREFHT': '2T_GDS4_SFC',
@@ -152,7 +152,7 @@ LOGISTIC_THRESH = {'pcp': 0,
                    't_mean': kFILL_VALUE,
                    't_range': kFILL_VALUE,
                    'tmean_mean': kFILL_VALUE,
-				   'rain_rate': 0}
+                   'rain_rate': 0}
 
 # TODO: add mechanisim for timezone offset
 GARD_TIMEFORMAT = '%Y-%m-%d %H:%M:%S'

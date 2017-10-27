@@ -8,6 +8,7 @@ from dateutil.relativedelta import relativedelta
 import numpy as np
 import dask
 import dask.multiprocessing
+import pandas as pd
 import xarray as xr
 from scipy.special import cbrt
 from scipy.stats import norm
@@ -23,6 +24,16 @@ from storylines.tools.encoding import attrs, encoding, make_gloabl_attrs
 
 PASS_THROUGH_PCP_MULT = 24  # units mm/hr to mm/day
 KELVIN = 273.15
+
+FILL_FEB_29 = True
+
+reindex_dates = {
+    'hist': xr.DataArray(pd.date_range('1950-01-01', '2005-12-31', freq='D'),
+                         dims='time', name='time'),
+    'rcp45': xr.DataArray(pd.date_range('2006-01-01', '2099-12-31', freq='D'),
+                          dims='time', name='time'),
+    'rcp85': xr.DataArray(pd.date_range('2006-01-01', '2099-12-31', freq='D'),
+                          dims='time', name='time')}
 
 MISSING = []
 EXISTING = []
@@ -48,11 +59,15 @@ def make_gard_like_obs(ds, obs, mask=None):
 
     if mask is not None:
         ds = ds.where(mask)
+        ds['mask'] = mask.astype(int)
+
+    if 'elevation' in obs:
+        ds['elevation'] = obs['elevation']
 
     return ds
 
 
-def get_rand_ds(rand_file, chunks=None, calendar=None,
+def get_rand_ds(rand_file, chunks=None, calendar='standard',
                 units='days since 1950-01-01'):
     rand_ds = xr.open_dataset(rand_file, chunks=chunks)
     rand_ds['time'] = nctime_to_nptime(
@@ -238,9 +253,9 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
 
             ds = make_gard_like_obs(ds, obs_ds)
             units = _get_units_from_drange(drange)
-            ds['time'] = nctime_to_nptime(
-                num2date(np.arange(0, ds.dims['time']),
-                         units, calendar=calendar))
+            ds['time'] = pd.DatetimeIndex(
+                nctime_to_nptime(num2date(np.arange(0, ds.dims['time']),
+                                          units, calendar=calendar)))
 
             ds_list.append(ds)
         ds = xr.concat(ds_list, dim='time')
@@ -249,6 +264,14 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
             ds = ds.load()
         elif chunks is not None:
             ds = ds.chunk(chunks=chunks)
+
+        if FILL_FEB_29:
+            print('dims before reindex/interpolate', ds.dims)
+            ds = ds.reindex_like(reindex_dates[scen])
+            ds[var] = ds[var].interpolate_na(
+                dim='time', kind='index', fill_value='extrapolate')
+            calendar = 'standard'
+            print('dims after reindex/interpolate', ds.dims)
 
         if rename_vars is not None and var in rename_vars:
             rename_dict = {}
@@ -300,7 +323,10 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
     # Add metadata
     ds_out['time'].encoding['calendar'] = calendar
     ds_out['time'].encoding['units'] = units
-    ds_out['time'].encoding['dtype'] = 'f8'
+
+    if calendar == 'noleap':
+        raise ValueError('temporary hard stop for noleap calendar')
+        # this can be removed after debugging
 
     return ds_out
 
@@ -389,6 +415,11 @@ def run(config_file, gcms=None, sets=None, variables=None, force_load=False,
             calendar = config['Calendars'].get(
                 gcm, config['Calendars'].get('all', 'standard'))
 
+            if FILL_FEB_29:
+                rand_calendar = 'standard'
+            else:
+                rand_calendar = calendar
+
             for scen, drange in dset_config['scenario'].items():
 
                 template = os.path.join(
@@ -417,7 +448,7 @@ def run(config_file, gcms=None, sets=None, variables=None, force_load=False,
                 # Get random dataset
                 print('opening %s' % rand_file)
                 rand_ds = get_rand_ds(rand_file, chunks=chunks,
-                                      calendar=calendar)
+                                      calendar=rand_calendar)
 
                 ds_out = process_gard_output(
                     setname, scen, periods, obs_ds, rand_ds,
@@ -436,22 +467,20 @@ def run(config_file, gcms=None, sets=None, variables=None, force_load=False,
                     MISSING.append(dm_fname_out + '\n')
                     continue
 
-                print(pre)
-                ds_out = ds_out.compute()
+                if not force_load:
+                    ds_out = ds_out.compute()
 
-                print(ds_out.info())
                 out_encoding = {}
-                for key in ds_out:
-                    try:
-                        out_encoding[key] = encoding[key]
-                    except KeyError:
-                        pass
-                print(out_encoding)
+                for key in ds_out.variables:
+                    out_encoding[key] = ds_out[key].encoding
+                    out_encoding[key].update(encoding.get(key, {}))
+                print('output encoding: ', out_encoding)
 
-                ds_out.to_netcdf(dm_fname_out, unlimited_dims=['time'],
-                                 format='NETCDF4', encoding=out_encoding)
                 ds_out.attrs = make_gloabl_attrs(
                     title='Post-processed GARD output downscaled dataset')
+                ds_out.to_netcdf(dm_fname_out, unlimited_dims=['time'],
+                                 format='NETCDF4', encoding=out_encoding)
+                ds_out.info()
 
 
 if __name__ == '__main__':

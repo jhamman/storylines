@@ -19,8 +19,6 @@ detrend = {'pcp': False, 't_mean': True, 't_range': True}
 extrapolate = {'pcp': 'max', 't_mean': 'both', 't_range': 'max'}
 zeros = {'pcp': True, 't_mean': False, 't_range': False}
 
-chunks = {}
-
 
 def quantile_mapping(input_data, ref_data, data_to_match, mask=None,
                      alpha=0.4, beta=0.4, detrend=False,
@@ -67,6 +65,7 @@ def quantile_mapping(input_data, ref_data, data_to_match, mask=None,
     This function will use `dask.array.map_blocks` if the input arguments are
     of type `dask.array.Array`.
     '''
+    print('quantile mapping now')
 
     assert input_data.get_axis_num('time') == 0
     assert data_to_match.get_axis_num('time') == 0
@@ -82,10 +81,9 @@ def quantile_mapping(input_data, ref_data, data_to_match, mask=None,
     # Make mask if mask is one was not provided
     if mask is None:
         d0 = input_data.isel(time=0, drop=False)
-        mask = xr.DataArray(~da.isnull(d0), dims=d0.dims,
-                            coords=d0.coords)
+        mask = d0.notnull().astype(int)
     else:
-        d0 = mask
+        d0 = mask.astype(int)
 
     chunks = d0.chunks
 
@@ -94,6 +92,7 @@ def quantile_mapping(input_data, ref_data, data_to_match, mask=None,
                   n_endpoints=n_endpoints, detrend=detrend)
 
     if isinstance(input_data.data, da.Array):
+        print('inputs are dask arrays')
         # dask arrays
         mask = mask.chunk(chunks)
 
@@ -446,14 +445,28 @@ def main():
     args = parser.parse_args()
 
     print('opening obs files %s' % args.obs_files)
-    obs = xr.open_mfdataset(args.obs_files, chunks=chunks,
+    obs = xr.open_mfdataset(args.obs_files,
                             decode_times=False, concat_dim='time')
-    mask = obs['elevation'].notnull().load()
+    obs['time'].values = np.arange(obs.dims['time'])
+    obs['time'].encoding = {}
+    obs['time'].attrs = {}
 
     if args.kind == 'gard':
-        data, ref, new_fname = _gard_func(args, obs, mask)
+        data, ref, new_fname = _gard_func(args, obs)
     elif args.kind == 'icar':
-        data, ref, new_fname = _icar_func(args, obs, mask)
+        data, ref, new_fname = _icar_func(args, obs)
+
+    if 'mask' in data:
+        mask = data['mask']
+    elif 'mask' in obs:
+        mask = obs['mask']
+    else:
+        mask = None
+    if mask is not None and 'time' in mask.coords:
+        mask = mask.isel(time=0, drop=True).astype(np.int)
+    if mask is not None:
+        print('number of points in mask:', mask.values.sum())
+        mask = mask.load()
 
     if args.skip_existing and os.path.isfile(new_fname):
         print('skipping: output file exists')
@@ -474,25 +487,45 @@ def main():
             data[var].load(),
             ref_da,
             obs[var].load(),
+            mask=mask,
             detrend=detrend[var],
             extrapolate='1to1',
             use_ref_data=use_ref_data)  # extrapolate[var])
+        if np.isnan(data[var]).all():
+            print('data[%s] is all nans' % var)
+        if np.isnan(obs[var]).all():
+            print('obs[%s] is all nans' % var)
+        if np.isnan(qm_ds[var]).all():
+            print('qm_ds[%s] is all nans' % var)
 
         if zeros[var]:
             # make sure a zero in the input data comes out as a zero
             qm_ds[var].values = np.where(data[var].values <= 0,
                                          0, qm_ds[var].values)
+    qm_ds['time'] = data['time']
+
+    for var in ['elevation', 'mask']:
+        if var in obs:
+            qm_ds[var] = obs[var]
+        elif var in data:
+            qm_ds[var] = data[var]
+        if 'time' in qm_ds[var].coords:
+            qm_ds[var] = qm_ds[var].isel(time=0, drop=True)
+    qm_ds['mask'] = qm_ds['mask'].astype(np.int)
 
     if 't_mean' in args.variables and 't_range' in args.variables:
         qm_ds['t_max'] = qm_ds['t_mean'] + 0.5 * qm_ds['t_range']
         qm_ds['t_min'] = qm_ds['t_mean'] - 0.5 * qm_ds['t_range']
 
-    use_encoding = {key: encoding[key] for key in qm_ds.data_vars}
+    use_encoding = {}
+    for key in qm_ds.data_vars:
+        if key in encoding:
+            use_encoding[key] = encoding[key]
 
     for var in qm_ds.data_vars:
         try:
-            qm_ds[var].attrs = attrs.get(var, obs[var])
-            qm_ds[var].encoding = use_encoding.get(var, obs[var])
+            qm_ds[var].attrs = attrs.get(var, obs[var].attrs)
+            qm_ds[var].encoding = use_encoding.get(var, obs[var].encoding)
         except KeyError:
             print('unable to find attributes for %s' % var)
             pass
@@ -500,14 +533,17 @@ def main():
     qm_ds.attrs = make_gloabl_attrs(title='Quantile mapped downscaled dataset')
 
     print('writing output file %s' % new_fname)
+    print(qm_ds)
+    qm_ds.info()
     qm_ds.to_netcdf(new_fname, unlimited_dims=['time'],
                     format='NETCDF4', encoding=use_encoding)
 
 
-def _gard_func(args, obs, mask):
+def _gard_func(args, obs):
     print('opening data file %s' % args.data)
-    data = xr.open_dataset(args.data, chunks=chunks)
-    if 't_mean' not in data:
+    data = xr.open_dataset(args.data)
+
+    if 't_mean' not in data and 't_min' in data and 't_max' in data:
         data['t_mean'] = (data['t_min'] + data['t_max']) / 2
 
     if args.ref == 'auto':
@@ -522,8 +558,8 @@ def _gard_func(args, obs, mask):
 
     if ref is not False and ref != args.data:
         print('opening ref file %s' % ref)
-        ref = xr.open_dataset(ref, chunks=chunks)
-        if 't_mean' not in ref:
+        ref = xr.open_dataset(ref)
+        if 't_mean' not in ref and 't_min' in ref and 't_max' in ref:
             ref['t_mean'] = (ref['t_min'] + ref['t_max']) / 2
     else:
         print('skipping reference data')
@@ -534,7 +570,7 @@ def _gard_func(args, obs, mask):
     return data, ref, new_fname
 
 
-def _icar_func(args, obs, mask):
+def _icar_func(args, obs):
 
     if os.path.isfile(args.data):
         data = xr.open_dataset(args.data).rename({'icar_pcp': 'pcp',
@@ -566,7 +602,7 @@ def _icar_func(args, obs, mask):
         else:
             ref_pattern = args.ref
         print('  ref->', ref_pattern, flush=True)
-        ref = xr.open_mfdataset(ref_pattern, chunks=chunks).rename(
+        ref = xr.open_mfdataset(ref_pattern).rename(
             {'icar_pcp': 'pcp', 'avg_ta2m': 't_mean'})
         ref['lon'].data[ref['lon'].data > 180] -= 360.
         ref['t_range'] = ref['max_ta2m'] - ref['min_ta2m']
