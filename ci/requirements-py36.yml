@@ -1,0 +1,34 @@
+name: storylines
+channels:
+  - conda-forge
+dependencies:
+  # Basics
+  - python=3.6
+  - jupyter
+  - jupyterlab
+  # Computation
+  - pandas
+  - xarray
+  - numpy
+  - scipy
+  - dask
+  - distributed
+  - numba
+  - bottleneck
+  - toolz
+  - scikit-learn
+  - geopandas
+  # I/O
+  - netcdf4
+  - h5netcdf
+  - rasterio
+  - h5py
+  - cdo
+  # Plotting and visualization
+  - matplotlib
+  - seaborn
+  - cartopy
+  - seaborn
+  # Testing
+  - pytest
+  - flake8
