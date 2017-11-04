@@ -1,5 +1,5 @@
 import os
-
+import warnings
 import dask.array as da
 import xarray as xr
 import numpy as np
@@ -347,7 +347,6 @@ def remove_trend(obj):
 def qmap_grid(data, like, ref, **kwargs):
 
     if isinstance(data.data, dask_array_type):
-        print('is dask type')
         kws = dict(dtype=data.dtype, chunks=data.chunks, **kwargs)
         if ref is not None:
             new = da.map_blocks(
@@ -358,7 +357,6 @@ def qmap_grid(data, like, ref, **kwargs):
                 _inner_qmap_grid, data.data, like.data, ref.data,
                 token="qmap_grid", use_ref_data=False, **kws)
     else:
-        print('is numpy dtype')
         # don't use dask map blocks
         if ref is not None:
             new = _inner_qmap_grid(data.data, like.data, ref.data,
@@ -431,8 +429,7 @@ def run(config, data, ref, obs_files, kind, variables):
             qm_ds[var].attrs = attrs.get(var, obs[var].attrs)
             qm_ds[var].encoding = use_encoding.get(var, obs[var].encoding)
         except KeyError:
-            print('unable to find attributes for %s' % var)
-            pass
+            warnings.warn('unable to find attributes for %s' % var)
 
     qm_ds.attrs = make_gloabl_attrs(title='Quantile mapped downscaled dataset')
 
