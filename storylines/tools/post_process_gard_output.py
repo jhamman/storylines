@@ -1,7 +1,4 @@
-#!/usr/bin/env python
-import sys
 import os
-import argparse
 import itertools
 from dateutil.relativedelta import relativedelta
 
@@ -20,12 +17,8 @@ from storylines.tools.gard_utils import (read_config, get_drange_chunks,
                                          list_like, _tslice_to_str)
 from storylines.tools.encoding import attrs, encoding, make_gloabl_attrs
 
-# dask.set_options(get=dask.multiprocessing.get, num_workers=16)
-
 PASS_THROUGH_PCP_MULT = 24  # units mm/hr to mm/day
 KELVIN = 273.15
-
-FILL_FEB_29 = True
 
 reindex_dates = {
     'hist': xr.DataArray(pd.date_range('1950-01-01', '2005-12-31', freq='D'),
@@ -34,9 +27,6 @@ reindex_dates = {
                           dims='time', name='time'),
     'rcp85': xr.DataArray(pd.date_range('2006-01-01', '2099-12-31', freq='D'),
                           dims='time', name='time')}
-
-MISSING = []
-EXISTING = []
 
 
 def _get_units_from_drange(d):
@@ -51,20 +41,13 @@ def _get_units_from_drange(d):
         return 'days since {:04}-{:02}-{:02}'.format(*map(int, dsplit))
 
 
-def make_gard_like_obs(ds, obs, mask=None):
+def make_gard_like_obs(ds, domain):
 
     ds = ds.rename({'x': 'lon', 'y': 'lat'})
-    ds.coords['lon'] = obs['lon']
-    ds.coords['lat'] = obs['lat']
+    ds.coords['lon'] = domain['lon']
+    ds.coords['lat'] = domain['lat']
 
-    if mask is not None:
-        ds = ds.where(mask)
-        ds['mask'] = mask.astype(int)
-
-    if 'elevation' in obs:
-        ds['elevation'] = obs['elevation']
-
-    return ds
+    return ds.merge(domain)
 
 
 def get_rand_ds(rand_file, chunks=None, calendar='standard',
@@ -77,9 +60,8 @@ def get_rand_ds(rand_file, chunks=None, calendar='standard',
     return rand_ds
 
 
-def add_random_effect(ds, da_normal, da_uniform=None,
-                      var=None, root=1., logistic_thresh=None,
-                      force_load=False):
+def add_random_effect(ds, da_normal, da_uniform=None, var=None, root=1.,
+                      logistic_thresh=None):
     '''Add random effects to dataset `ds`
 
     Parameters
@@ -113,9 +95,7 @@ def add_random_effect(ds, da_normal, da_uniform=None,
 
         # Get the array of uniform errors
         r_uniform = da_uniform.sel(time=slice(t0, t1))
-        if force_load:
-            print('loading uniform random data')
-            r_uniform = r_uniform.load()
+
         # Get the exceedence variable (e.g. POP)
         da_ex = ds[exceedence_var]
 
@@ -136,9 +116,6 @@ def add_random_effect(ds, da_normal, da_uniform=None,
     else:
         mask = None
         r_normal = da_normal.sel(time=slice(t0, t1))
-        if force_load:
-            print('loading normal data')
-            r_normal = r_normal.load()
 
     if root == 1.:
         da_errors = da + (da_errors * r_normal)
@@ -166,9 +143,7 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
                         roots={'pcp': 3., 't_mean': 1, 't_range': 1},
                         rand_vars={'pcp': 'p_rand', 't_mean': 't_rand',
                                    't_range': 't_rand'},
-                        chunks=None,
-                        force_load=False,
-                        skip_missing=False):
+                        chunks=None):
 
     '''Top level function for processing raw gard output
 
@@ -209,7 +184,6 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
     add_random_effect
     make_gard_like_obs
     '''
-    skip_missing = True
     if not isinstance(obs_ds, xr.Dataset):
         # we'll assume that obs_ds is a string/path/or something that
         # xr.open_dataset can open, if not, we'll raise an error right away
@@ -235,10 +209,6 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
             pre = template.format(se=se, drange=drange, scen=scen)
 
             fname = pre + '{}.nc'.format(var)
-            if skip_missing and not os.path.isfile(fname):
-                print('skipping because %s is missing' % fname)
-                return None
-            print('opening %s' % fname)
             ds = xr.open_dataset(fname)
             fname = pre + '{}_errors.nc'.format(var)
             ds.merge(xr.open_dataset(fname),
@@ -246,7 +216,6 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
             try:
                 fname = pre + '{}_logistic.nc'.format(var)
                 ds.merge(xr.open_dataset(fname), inplace=True)
-                print('opening %s' % fname)
                 exceedence_var = True
             except (FileNotFoundError, OSError):
                 pass
@@ -258,20 +227,12 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
                                           units, calendar=calendar)))
 
             ds_list.append(ds)
-        ds = xr.concat(ds_list, dim='time')
-        if force_load:
-            print('loading prediction data')
-            ds = ds.load()
-        elif chunks is not None:
-            ds = ds.chunk(chunks=chunks)
+        ds = xr.concat(ds_list, dim='time').chunk(chunks=chunks)
 
-        if FILL_FEB_29:
-            print('dims before reindex/interpolate', ds.dims)
-            ds = ds.reindex_like(reindex_dates[scen])
-            ds[var] = ds[var].interpolate_na(
-                dim='time', kind='index', fill_value='extrapolate')
-            calendar = 'standard'
-            print('dims after reindex/interpolate', ds.dims)
+        ds = ds.reindex_like(reindex_dates[scen])
+        ds[var] = ds[var].interpolate_na(
+            dim='time', kind='index', fill_value='extrapolate')
+        calendar = 'standard'
 
         if rename_vars is not None and var in rename_vars:
             rename_dict = {}
@@ -293,8 +254,7 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
             rand_var = rand_vars[var]
             da_errors = add_random_effect(ds, rand_ds[rand_var],
                                           rand_ds['p_rand_uniform'],
-                                          var=var, root=root,
-                                          force_load=force_load)
+                                          var=var, root=root)
 
         else:
             if var == 'pcp':
@@ -324,42 +284,10 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
     ds_out['time'].encoding['calendar'] = calendar
     ds_out['time'].encoding['units'] = units
 
-    if calendar == 'noleap':
-        raise ValueError('temporary hard stop for noleap calendar')
-        # this can be removed after debugging
-
     return ds_out
 
 
-def main():
-
-    # Not sure why I need this...
-    argparse.ArgumentParser.prog = 'junk'
-    argparse.ArgumentParser.usage = 'junk'
-    argparse.ArgumentParser.formatter_class = 'junk'
-    argparse.ArgumentParser.add_help = 'junk'
-    # end funny stuff
-
-    parser = argparse.ArgumentParser(
-        prog='post_process_gard_output',
-        description='Post Process GARD output')
-    parser.add_argument('config_file', metavar='config_file',
-                        help='configuration file for downscaling matrix')
-    parser.add_argument('--force_load', action='store_true')
-    parser.add_argument('--sets', type=str, nargs='+', default=None)
-    parser.add_argument('--gcms', type=str, nargs='+', default=None)
-    parser.add_argument('--vars', type=str, nargs='+', default=None)
-    parser.add_argument('--skip_missing', action='store_true')
-    parser.add_argument('--skip_existing', action='store_true')
-    args = parser.parse_args()
-
-    run(args.config_file, gcms=args.gcms, sets=args.sets, variables=args.vars,
-        force_load=args.force_load, skip_missing=args.skip_missing,
-        skip_existing=args.skip_existing)
-
-
-def run(config_file, gcms=None, sets=None, variables=None, force_load=False,
-        skip_missing=False, skip_existing=False):
+def run(config_file, gcms=None, sets=None, variables=None):
 
     config = read_config(config_file)
 
@@ -371,10 +299,7 @@ def run(config_file, gcms=None, sets=None, variables=None, force_load=False,
     rename_vars = config['PostProc']['rename_vars']
     rand_file = config['PostProc']['rand_file']
 
-    if force_load:
-        chunks = None
-    else:
-        chunks = config['PostProc'].get('chunks', None)
+    chunks = config['PostProc'].get('chunks', None)
 
     # create directories if they don't exist yet
     data_dir = config['Options']['DataDir']
@@ -385,7 +310,6 @@ def run(config_file, gcms=None, sets=None, variables=None, force_load=False,
     chunk_years = relativedelta(years=int(config['Options']['ChunkYears']))
 
     # Get obs dataset
-    print('opening %s' % config['Obs_Dataset']['ObsInputPattern'])
     obs_ds = xr.open_dataset(config['Obs_Dataset']['ObsInputPattern'],
                              chunks=chunks)
     obs_mask = (obs_ds['pcp'].isel(time=0, drop=True) >= 0)
@@ -415,10 +339,7 @@ def run(config_file, gcms=None, sets=None, variables=None, force_load=False,
             calendar = config['Calendars'].get(
                 gcm, config['Calendars'].get('all', 'standard'))
 
-            if FILL_FEB_29:
-                rand_calendar = 'standard'
-            else:
-                rand_calendar = calendar
+            rand_calendar = 'standard'  # TODO: get this from PostProc dict
 
             for scen, drange in dset_config['scenario'].items():
 
@@ -441,12 +362,7 @@ def run(config_file, gcms=None, sets=None, variables=None, force_load=False,
                 # mm_fname_out = pre + 'mm.nc'
                 dm_fname_out = pre + 'dm.nc'
 
-                if skip_existing and os.path.isfile(dm_fname_out):
-                    EXISTING.append(dm_fname_out + '\n')
-                    continue
-
                 # Get random dataset
-                print('opening %s' % rand_file)
                 rand_ds = get_rand_ds(rand_file, chunks=chunks,
                                       calendar=rand_calendar)
 
@@ -459,47 +375,14 @@ def run(config_file, gcms=None, sets=None, variables=None, force_load=False,
                     rename_vars=rename_vars,
                     roots=roots,
                     rand_vars=rand_vars,
-                    chunks=chunks,
-                    force_load=force_load,
-                    skip_missing=skip_missing)
-
-                if ds_out is None:
-                    MISSING.append(dm_fname_out + '\n')
-                    continue
-
-                if not force_load:
-                    ds_out = ds_out.compute()
+                    chunks=chunks)
 
                 out_encoding = {}
                 for key in ds_out.variables:
                     out_encoding[key] = ds_out[key].encoding
                     out_encoding[key].update(encoding.get(key, {}))
-                print('output encoding: ', out_encoding)
 
                 ds_out.attrs = make_gloabl_attrs(
                     title='Post-processed GARD output downscaled dataset')
                 ds_out.to_netcdf(dm_fname_out, unlimited_dims=['time'],
                                  format='NETCDF4', encoding=out_encoding)
-                ds_out.info()
-
-
-if __name__ == '__main__':
-    print('post_process_gard_output')
-    try:
-        main()
-    except:
-        # write out failed arguments
-        with open("FAILED.txt", "a") as f:
-            line = ' '.join(sys.argv) + '\n'
-            f.write(line)
-        raise
-
-    print('complete')
-    # write out cases flagged as missing
-    with open("MISSING.txt", "a") as f:
-        f.writelines(MISSING)
-    # write out cases flagged as existing
-    with open("EXISTING.txt", "a") as f:
-        f.writelines(EXISTING)
-    print('EXISTING: %s' % ', '.join(EXISTING))
-    print('MISSING: %s' % ', '.join(MISSING))

@@ -1,13 +1,10 @@
-#!/usr/bin/env python
-import sys
-import numpy as np
-from scipy import stats
-
 import os
-import argparse
 
 import dask.array as da
 import xarray as xr
+import numpy as np
+from scipy import stats
+from xarray.core.pycompat import dask_array_type
 
 from storylines.tools.encoding import attrs, encoding, make_gloabl_attrs
 
@@ -20,7 +17,7 @@ extrapolate = {'pcp': 'max', 't_mean': 'both', 't_range': 'max'}
 zeros = {'pcp': True, 't_mean': False, 't_range': False}
 
 
-def quantile_mapping(input_data, ref_data, data_to_match, mask=None,
+def quantile_mapping(input_data, ref_data, data_to_match,
                      alpha=0.4, beta=0.4, detrend=False,
                      extrapolate=None, n_endpoints=10,
                      use_ref_data=True):
@@ -35,8 +32,6 @@ def quantile_mapping(input_data, ref_data, data_to_match, mask=None,
         Reference data to be used to adjust `input_data`
     data_to_match : xr.DataArray
         Target data for quantile mapping
-    mask : xr.DataArray (optional, boolean)
-        2-dimensional mask where quantile mapping should be performed
     alpha, beta : float
         Plotting positions parameter. Default is 0.4.
     detrend : bool
@@ -59,76 +54,26 @@ def quantile_mapping(input_data, ref_data, data_to_match, mask=None,
     See Also
     --------
     scipy.stats.mstats.plotting_positions
-
-    Note
-    ----
-    This function will use `dask.array.map_blocks` if the input arguments are
-    of type `dask.array.Array`.
     '''
-    print('quantile mapping now')
 
-    assert input_data.get_axis_num('time') == 0
-    assert data_to_match.get_axis_num('time') == 0
-    shape = input_data.shape[1:]
-    assert shape == data_to_match.shape[1:]
+    if detrend:
+        # remove linear trend, saving the slope/intercepts for use later
+        input_data, input_data_trend = remove_trend(input_data)
+        data_to_match, _ = remove_trend(data_to_match)
+        if ref_data is not None:
+            ref_data, _ = remove_trend(ref_data)
 
-    if ref_data is not False:
-        assert ref_data.get_axis_num('time') == 0
-        assert shape == ref_data.shape[1:]
-    if use_ref_data and ref_data is False:
-        raise ValueError('cannot use ref_data without ref_data')
-
-    # Make mask if mask is one was not provided
-    if mask is None:
-        d0 = input_data.isel(time=0, drop=False)
-        mask = d0.notnull().astype(int)
-    else:
-        d0 = mask.astype(int)
-
-    chunks = d0.chunks
-
-    # keyword args to qmap
+    # arguments to qmap
     kwargs = dict(alpha=alpha, beta=beta, extrapolate=extrapolate,
-                  n_endpoints=n_endpoints, detrend=detrend)
+                  n_endpoints=n_endpoints)
 
-    if isinstance(input_data.data, da.Array):
-        print('inputs are dask arrays')
-        # dask arrays
-        mask = mask.chunk(chunks)
+    new = qmap_grid(input_data, ref_data, data_to_match, **kwargs)
 
-        assert chunks == input_data.data.chunks[1:]
-        assert chunks == data_to_match.data.chunks[1:]
+    # put the trend back
+    if detrend:
+        new += input_data_trend
 
-        if use_ref_data:
-            assert chunks == ref_data.data.chunks[1:]
-
-            new = da.map_blocks(_qmap_wrapper, input_data.data, ref_data.data,
-                                data_to_match.data, mask.data,
-                                dtype=input_data.data.dtype,
-                                chunks=input_data.data.chunks,
-                                name='qmap', use_ref_data=use_ref_data,
-                                **kwargs)
-        else:
-            new = da.map_blocks(_qmap_wrapper, input_data.data, False,
-                                data_to_match.data, mask.data,
-                                dtype=input_data.data.dtype,
-                                chunks=input_data.data.chunks,
-                                name='qmap', use_ref_data=use_ref_data,
-                                **kwargs)
-
-    else:
-        # numpy arrays
-        if use_ref_data:
-            new = _qmap_wrapper(input_data.data, ref_data.data,
-                                data_to_match.data,
-                                mask.data, use_ref_data=use_ref_data, **kwargs)
-        else:
-            new = _qmap_wrapper(input_data.data, False, data_to_match.data,
-                                mask.data, use_ref_data=use_ref_data, **kwargs)
-
-    return xr.DataArray(new, dims=input_data.dims, coords=input_data.coords,
-                        attrs=input_data.attrs,
-                        name=input_data.name).where(mask)
+    return new
 
 
 def quantile_mapping_by_group(input_data, ref_data, data_to_match,
@@ -176,23 +121,20 @@ def quantile_mapping_by_group(input_data, ref_data, data_to_match,
 
     # Iterate over the groups, calling the quantile method function on each
     results = []
-    if ref_data is not False:
+    if ref_data is not None:
         ref_groups = ref_data.groupby(grouper)
-        for (key_obs, group_obs), (key_ref, group_ref), (key_input, group_input) \
-                in zip(obs_groups, ref_groups, input_groups):
-            results.append(quantile_mapping(group_input, group_ref, group_obs,
-                                            **kwargs))
+        for (_, g_obs), (_, g_ref), (_, g_input) in zip(obs_groups, ref_groups,
+                                                        input_groups):
+            results.append(quantile_mapping(g_input, g_ref, g_obs, **kwargs))
     else:
-        for (key_obs, group_obs), (key_input, group_input) \
-                in zip(obs_groups, input_groups):
-            results.append(quantile_mapping(group_input, False, group_obs,
+        for (_, group_obs), (_, group_input) in zip(obs_groups, input_groups):
+            results.append(quantile_mapping(group_input, None, group_obs,
                                             **kwargs))
 
     # put the groups back together
     new_concat = xr.concat(results, dim='time')
     # Now sort the time dimension again
-    sort_inds = np.argsort(new_concat.time.values)
-    new_concat = new_concat.isel(time=sort_inds)
+    new_concat = new_concat.sortby('time')
 
     return new_concat
 
@@ -276,13 +218,10 @@ def _custom_extrapolate_x_data(x, y, n_endpoints):
     upper_inds = np.nonzero(np.inf == x)[0]
     if len(lower_inds):
         s = slice(lower_inds[-1] + 1, lower_inds[-1] + 1 + n_endpoints)
-        print(s, lower_inds[-1], n_endpoints, x[s])
-        assert not np.isinf(x[s]).any()
         slope, intercept, _, _, _ = stats.linregress(x[s], y[s])
         x[lower_inds] = (y[lower_inds] - intercept) / slope
     if len(upper_inds):
         s = slice(upper_inds[0] - n_endpoints, upper_inds[0])
-        assert not np.isinf(x[s]).any()
         slope, intercept, _, _, _ = stats.linregress(x[s], y[s])
         x[upper_inds] = (y[upper_inds] - intercept) / slope
     return x
@@ -313,30 +252,13 @@ def calc_endpoints(x, y, extrapolate, n_endpoints):
     return y
 
 
-def remove_trend(y, inplace=False):
-    if inplace:
-        detrended = y
-    else:
-        detrended = y.copy()
-
-    t = np.arange(len(y))
-    slope = stats.linregress(t, y)[0]  # extract slope only
-    trend = t * slope
-    detrended -= trend
-
-    return detrended, trend
-
-
-def qmap(data, ref, like, alpha=0.4, beta=0.4, extrapolate=None,
-         n_endpoints=10, detrend=None, use_ref_data=True):
+def qmap(data, like, ref=None, alpha=0.4, beta=0.4, extrapolate=None,
+         n_endpoints=10):
     '''quantile mapping for a single point'''
 
-    inplace = False
-
-    if detrend:
-        # remove linear trend, saving the slope/intercepts for use later
-        data, data_trend = remove_trend(data, inplace=inplace)
-        like, _ = remove_trend(like, inplace=inplace)
+    # fast track if data has nans
+    if np.isnan(np.sum(data)):
+        return np.full_like(data, np.nan)
 
     # x is the percentiles
     # y is the sorted data
@@ -352,10 +274,7 @@ def qmap(data, ref, like, alpha=0.4, beta=0.4, extrapolate=None,
 
     # map the quantiles from ref-->data
     # TODO: move to its own function
-    if use_ref_data and ref is not False:
-        if detrend:
-            ref, _ = remove_trend(ref, inplace=inplace)
-
+    if ref is not None:
         x_ref, y_ref = _extrapolate(np.sort(ref), alpha, beta, n_endpoints,
                                     how=extrapolate, x_min=-1e10, x_max=1e10)
 
@@ -375,7 +294,7 @@ def qmap(data, ref, like, alpha=0.4, beta=0.4, extrapolate=None,
 
     # If extrapolate is 1to1, apply the offset between ref and like to the
     # tails of new
-    if use_ref_data and (ref is not False) and (extrapolate == '1to1'):
+    if ref is not None and extrapolate == '1to1':
         ref_max = ref.max()
         ref_min = ref.min()
         inds = (data > ref_max)
@@ -399,30 +318,72 @@ def qmap(data, ref, like, alpha=0.4, beta=0.4, extrapolate=None,
                 like_at_ref_min = np.interp(x_ref[0], x_like, y_like)
                 new[inds] = like_at_ref_min + (data[inds] - ref_min)
 
-    # put the trend back
-    if detrend:
-        new += data_trend
-
     return new
 
 
-def _qmap_wrapper(data, ref, like, mask, **kwargs):
+def _calc_slope(x, y):
+    '''wrapper that returns the slop from a linear regression fit of x and y'''
+    slope = stats.linregress(x, y)[0]  # extract slope only
+    return slope
 
+
+def remove_trend(obj):
+    time_nums = xr.DataArray(obj['time'].values.astype(np.float),
+                             dims='time',
+                             coords={'time': obj['time']},
+                             name='time_nums')
+    trend = xr.apply_ufunc(_calc_slope, time_nums, obj,
+                           vectorize=True,
+                           input_core_dims=[['time'], ['time']],
+                           output_core_dims=[[]],
+                           output_dtypes=[np.float],
+                           dask='parallelized')
+
+    trend_ts = (time_nums * trend).transpose(*obj.dims)
+    detrended = obj - trend_ts
+    return detrended, trend_ts
+
+
+def qmap_grid(data, like, ref, **kwargs):
+
+    if isinstance(data.data, dask_array_type):
+        print('is dask type')
+        kws = dict(dtype=data.dtype, chunks=data.chunks, **kwargs)
+        if ref is not None:
+            new = da.map_blocks(
+                _inner_qmap_grid, data.data, like.data, ref.data,
+                token="qmap_grid", use_ref_data=True, **kws)
+        else:
+            new = da.map_blocks(
+                _inner_qmap_grid, data.data, like.data, ref.data,
+                token="qmap_grid", use_ref_data=False, **kws)
+    else:
+        print('is numpy dtype')
+        # don't use dask map blocks
+        if ref is not None:
+            new = _inner_qmap_grid(data.data, like.data, ref.data,
+                                   use_ref_data=True, **kwargs)
+        else:
+            new = _inner_qmap_grid(data.data, like.data, ref.data,
+                                   use_ref_data=False, **kwargs)
+
+    return xr.DataArray(new, dims=data.dims, coords=data.coords,
+                        attrs=like.attrs, name=like.name)
+
+
+def _inner_qmap_grid(data, like, ref, use_ref_data=False, **kwargs):
     new = np.full_like(data, np.nan)
-    ii, jj = np.nonzero(mask)
-    if kwargs.get('use_ref_data', True) and ref is not False:
-        for i, j in zip(ii, jj):
-            new[:, i, j] = qmap(data[:, i, j], ref[:, i, j], like[:, i, j],
+    if use_ref_data:
+        for i, j in np.ndindex(data.shape[1:]):
+            new[:, i, j] = qmap(data[:, i, j], like[:, i, j], ref=ref[:, i, j],
                                 **kwargs)
     else:
-        for i, j in zip(ii, jj):
-            new[:, i, j] = qmap(data[:, i, j], False, like[:, i, j],
-                                **kwargs)
-
+        for i, j in np.ndindex(data.shape[1:]):
+            new[:, i, j] = qmap(data[:, i, j], like[:, i, j], **kwargs)
     return new
 
 
-def main():
+def run(config, data, ref, obs_files, kind, variables):
     """
     Generate high-resolution meteorologic forcings by downscaling the GCM
     and/or RCM using the Generalized Analog Regression Downscaling (GARD) tool.
@@ -431,89 +392,32 @@ def main():
     Configuration file formatted with the following options:
     TODO: Add sample config
     """
-    # Define usage and set command line arguments
-    parser = argparse.ArgumentParser(
-        description='Downscale ensemble forcings')
-    parser.add_argument('--data', help='data file')
-    parser.add_argument('--ref', help='reference data file', default=False)
-    parser.add_argument('--obs_files', nargs='+', help='obs data file(s)',
-                        default=['/glade/u/home/jhamman/workdir/GARD_inputs/newman_ensemble/conus_ens_00%d.nc' % i for i in range(1, 6)])
-    parser.add_argument('--kind', help='input data type', default='gard')
-    parser.add_argument('--variables', nargs='+', default=variables,
-                        help='list of variables to quantile map')
-    parser.add_argument('--skip_existing', action='store_true')
-    args = parser.parse_args()
 
-    print('opening obs files %s' % args.obs_files)
-    obs = xr.open_mfdataset(args.obs_files,
+    obs = xr.open_mfdataset(obs_files,
                             decode_times=False, concat_dim='time')
     obs['time'].values = np.arange(obs.dims['time'])
     obs['time'].encoding = {}
     obs['time'].attrs = {}
 
-    if args.kind == 'gard':
-        data, ref, new_fname = _gard_func(args, obs)
-    elif args.kind == 'icar':
-        data, ref, new_fname = _icar_func(args, obs)
-
-    if 'mask' in data:
-        mask = data['mask']
-    elif 'mask' in obs:
-        mask = obs['mask']
-    else:
-        mask = None
-    if mask is not None and 'time' in mask.coords:
-        mask = mask.isel(time=0, drop=True).astype(np.int)
-    if mask is not None:
-        print('number of points in mask:', mask.values.sum())
-        mask = mask.load()
-
-    if args.skip_existing and os.path.isfile(new_fname):
-        print('skipping: output file exists')
-        with open("QM_EXISTING.txt", "a") as f:
-            f.write(new_fname + '\n')
-        return
+    if kind == 'gard':
+        data, ref, new_fname = _gard_func(data, ref)
+    elif kind == 'icar':
+        data, ref, new_fname = _icar_func(data, ref)
 
     qm_ds = xr.Dataset()
-    for var in args.variables:
-        print(var, flush=True)
-        if ref is not False:
-            ref_da = ref[var].load()
-            use_ref_data = True
-        else:
-            use_ref_data = False
-            ref_da = False
+    for var in variables:
         qm_ds[var] = quantile_mapping(
-            data[var].load(),
-            ref_da,
-            obs[var].load(),
-            mask=mask,
+            data[var], ref[var], obs[var],
             detrend=detrend[var],
-            extrapolate='1to1',
-            use_ref_data=use_ref_data)  # extrapolate[var])
-        if np.isnan(data[var]).all():
-            print('data[%s] is all nans' % var)
-        if np.isnan(obs[var]).all():
-            print('obs[%s] is all nans' % var)
-        if np.isnan(qm_ds[var]).all():
-            print('qm_ds[%s] is all nans' % var)
+            extrapolate='1to1')
 
         if zeros[var]:
             # make sure a zero in the input data comes out as a zero
-            qm_ds[var].values = np.where(data[var].values <= 0,
-                                         0, qm_ds[var].values)
+            qm_ds[var] = xr.where(data[var] <= 0, 0, qm_ds[var])
+
     qm_ds['time'] = data['time']
 
-    for var in ['elevation', 'mask']:
-        if var in obs:
-            qm_ds[var] = obs[var]
-        elif var in data:
-            qm_ds[var] = data[var]
-        if 'time' in qm_ds[var].coords:
-            qm_ds[var] = qm_ds[var].isel(time=0, drop=True)
-    qm_ds['mask'] = qm_ds['mask'].astype(np.int)
-
-    if 't_mean' in args.variables and 't_range' in args.variables:
+    if 't_mean' in variables and 't_range' in variables:
         qm_ds['t_max'] = qm_ds['t_mean'] + 0.5 * qm_ds['t_range']
         qm_ds['t_min'] = qm_ds['t_mean'] - 0.5 * qm_ds['t_range']
 
@@ -532,23 +436,19 @@ def main():
 
     qm_ds.attrs = make_gloabl_attrs(title='Quantile mapped downscaled dataset')
 
-    print('writing output file %s' % new_fname)
-    print(qm_ds)
-    qm_ds.info()
     qm_ds.to_netcdf(new_fname, unlimited_dims=['time'],
                     format='NETCDF4', encoding=use_encoding)
 
 
-def _gard_func(args, obs):
-    print('opening data file %s' % args.data)
-    data = xr.open_dataset(args.data)
+def _gard_func(data, ref):
+    data = xr.open_dataset(data)
 
     if 't_mean' not in data and 't_min' in data and 't_max' in data:
         data['t_mean'] = (data['t_min'] + data['t_max']) / 2
 
-    if args.ref == 'auto':
+    if ref == 'auto':
         template = 'gard_output.{gset}.{dset}.{gcm}.{scen}.{date_range}.dm.nc'
-        _, gset, dset, gcm, scen, drange, step, _ = args.data.split('.')
+        _, gset, dset, gcm, scen, drange, step, _ = data.split('.')
 
         ref_time = {'NCAR_WRF_50km': '19510101-20051231',
                     'NCAR_WRF_50km_reanalysis': '19790101-20151231'}
@@ -556,35 +456,32 @@ def _gard_func(args, obs):
         ref = template.format(gset=gset, dset=dset, gcm=gcm,
                               scen='hist', date_range=ref_time[dset])
 
-    if ref is not False and ref != args.data:
-        print('opening ref file %s' % ref)
+    if ref is not None and ref != data:
         ref = xr.open_dataset(ref)
         if 't_mean' not in ref and 't_min' in ref and 't_max' in ref:
             ref['t_mean'] = (ref['t_min'] + ref['t_max']) / 2
     else:
-        print('skipping reference data')
-        ref = False
+        ref = {v: None for v in data}
 
-    new_fname = args.data[:-3] + '.qm.nc'
+    new_fname = data[:-3] + '.qm.nc'
 
     return data, ref, new_fname
 
 
-def _icar_func(args, obs):
+def _icar_func(data, ref):
 
-    if os.path.isfile(args.data):
-        data = xr.open_dataset(args.data).rename({'icar_pcp': 'pcp',
-                                                  'avg_ta2m': 't_mean'})
-        case_name = os.path.basename(args.data)
-        pattern = args.data
+    if os.path.isfile(data):
+        data = xr.open_dataset(data).rename({'icar_pcp': 'pcp',
+                                             'avg_ta2m': 't_mean'})
+        case_name = os.path.basename(data)
+        pattern = data
         for scen in ['hist', 'rcp45', 'rcp85']:
             if scen in case_name:
                 break
     else:
-        dirname = args.data
+        dirname = data
         case_name = os.path.split(dirname)[-1]
         pattern = os.path.join(dirname, 'merged', 'merged_%s_*.nc' % case_name)
-        print(case_name, pattern, flush=True)
 
         data = xr.open_mfdataset(pattern).rename({'icar_pcp': 'pcp',
                                                   'avg_ta2m': 't_mean'})
@@ -595,13 +492,12 @@ def _icar_func(args, obs):
     data['t_range'] = data['max_ta2m'] - data['min_ta2m']
 
     if scen == 'hist':
-        ref = False
+        ref = {v: None for v in data}
     else:
-        if args.ref == 'auto':
+        if ref == 'auto':
             ref_pattern = pattern.replace(scen, 'hist')
         else:
-            ref_pattern = args.ref
-        print('  ref->', ref_pattern, flush=True)
+            ref_pattern = ref
         ref = xr.open_mfdataset(ref_pattern).rename(
             {'icar_pcp': 'pcp', 'avg_ta2m': 't_mean'})
         ref['lon'].data[ref['lon'].data > 180] -= 360.
@@ -610,14 +506,3 @@ def _icar_func(args, obs):
     new_fname = '/glade/u/home/jhamman/workdir/icar_qm/%s' % case_name
 
     return data, ref, new_fname
-
-
-if __name__ == "__main__":
-    try:
-        main()
-    except:
-        # write out failed arguments
-        with open("FAILED.txt", "a") as f:
-            line = ' '.join(sys.argv) + '\n'
-            f.write(line)
-        raise
