@@ -1,5 +1,8 @@
 #!/usr/bin/env python
-import argparse
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
 import glob
 import os.path
 import itertools
@@ -9,7 +12,6 @@ from collections import namedtuple
 import warnings
 import shutil
 
-import numpy as np
 import pandas as pd
 import xarray as xr
 
@@ -17,6 +19,8 @@ from tonic.io import read_configobj as read_config
 
 import logging
 import logging.config
+
+from .qc import check_times
 
 
 def set_logger(name='logname', loglvl='DEBUG'):
@@ -162,7 +166,7 @@ filelistkey = namedtuple('filelistkey',
 
 
 # -------------------------------------------------------------------------#
-def main():
+def run(config, outfile):
     """
     Generate high-resolution meteorologic forcings by downscaling the GCM
     and/or RCM using the Generalized Analog Regression Downscaling (GARD) tool.
@@ -171,19 +175,8 @@ def main():
     Configuration file formatted with the following options:
     TODO: Add sample config
     """
-
-    # Define usage and set command line arguments
-    parser = argparse.ArgumentParser(
-        description='Downscale ensemble forcings')
-    parser.add_argument('config_file', metavar='config_file',
-                        help='configuration file for downscaling matrix')
-    parser.add_argument('--outfile', metavar='outfile', default='namelist.txt',
-                        help='output file downscaling namelists')
-    args = parser.parse_args()
-
     # Read configuration file into a dictionary
-    config = read_config(args.config_file)
-    outfile = args.outfile
+    config = read_config(config)
 
     log_level = config['Options']['LogLevel']
     chunk_years = relativedelta(years=int(config['Options']['ChunkYears']))
@@ -229,7 +222,7 @@ def main():
             print(gcms)
 
         train_calendar = dset_config.get('TrainCalendar', None)
-        obs_calendar = config['Obs_Dataset'].get('ObsCalendar', None)
+        obs_calendar = config['ObsDataset'].get('ObsCalendar', None)
 
         for setname, set_config in prediction_sets.items():
 
@@ -270,7 +263,7 @@ def main():
                                   scenario='training')
 
                 file_lists[key], file_lists_len[key] = make_filelist(
-                    key, config['Obs_Dataset']['ObsInputPattern'],
+                    key, config['ObsDataset']['ObsInputPattern'],
                     prefix=filelist_dir, calendar=obs_calendar)
 
             for var in vars_list:
@@ -413,9 +406,9 @@ def main():
     with open(outfile, 'w') as f:
         f.writelines('\n'.join(namelists))
 
-    config = os.path.join(data_dir, os.path.basename(args.config_file))
+    config = os.path.join(data_dir, os.path.basename(config))
     logger.info('writing config file %s', config)
-    shutil.copyfile(args.config_file, config)
+    shutil.copyfile(config, config)
 
     return
 
@@ -475,32 +468,6 @@ def get_filelist(pattern, date_range=None, timevar='time', calendar=None):
         files = sublist
     files.sort()
     return files
-
-
-def check_times(times, min_delta=np.timedelta64(1, 's'),
-                max_delta=np.timedelta64(49, 'h'), f=None):
-    '''QC time variable from a netcdf file.
-
-    Raise a ValueError if a check is violated.
-
-    Current checks:
-    1) Timestamps must be monotonic (increasing)
-    2) Maximum timestep size must less than a certain threshold (max_delta)
-    '''
-    diffs = np.diff(times)
-    negs = np.nonzero(diffs < min_delta)[0]
-    too_big = np.nonzero(diffs > max_delta)[0]
-
-    if len(negs) > 0:
-        datestamps = pd.to_datetime(times[negs[0]-1: negs[0]+2])
-        warnings.warn('%s: times are not monotonically increasing. '
-                      'Found timestamp < %s at %s, first example: '
-                      '%s' % (f, min_delta, negs, datestamps))
-    if len(too_big) > 0:
-        datestamps = pd.to_datetime(times[too_big[0]-1: too_big[0]+2])
-        warnings.warn('%s: found a timestep where its delta is too '
-                      'large (greater than %s) at %s, first example: '
-                      '%s' % (f, max_delta, too_big, datestamps))
 
 
 def write_filelist(fname, files, check=False):
@@ -713,8 +680,3 @@ def get_drange_chunks(dates, max_chunk_size=relativedelta(years=5)):
         end += max_chunk_size
 
     return chunked_dates
-
-
-# ---------------------------------------------------------------------------#
-if __name__ == "__main__":
-    main()

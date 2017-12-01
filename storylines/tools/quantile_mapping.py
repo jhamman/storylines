@@ -1,3 +1,7 @@
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
 import os
 import warnings
 import dask.array as da
@@ -67,7 +71,7 @@ def quantile_mapping(input_data, ref_data, data_to_match,
     kwargs = dict(alpha=alpha, beta=beta, extrapolate=extrapolate,
                   n_endpoints=n_endpoints)
 
-    new = qmap_grid(input_data, ref_data, data_to_match, **kwargs)
+    new = qmap_grid(input_data, data_to_match, ref_data, **kwargs)
 
     # put the trend back
     if detrend:
@@ -354,7 +358,7 @@ def qmap_grid(data, like, ref, **kwargs):
                 token="qmap_grid", use_ref_data=True, **kws)
         else:
             new = da.map_blocks(
-                _inner_qmap_grid, data.data, like.data, ref.data,
+                _inner_qmap_grid, data.data, like.data, None,
                 token="qmap_grid", use_ref_data=False, **kws)
     else:
         # don't use dask map blocks
@@ -381,26 +385,18 @@ def _inner_qmap_grid(data, like, ref, use_ref_data=False, **kwargs):
     return new
 
 
-def run(config, data, ref, obs_files, kind, variables):
+def run(data_file, ref_file, obs_files, kind, variables):
     """
-    Generate high-resolution meteorologic forcings by downscaling the GCM
-    and/or RCM using the Generalized Analog Regression Downscaling (GARD) tool.
-
-    Inputs:
-    Configuration file formatted with the following options:
-    TODO: Add sample config
+    Wrapper around the quantile mapping functions in this module
     """
 
-    obs = xr.open_mfdataset(obs_files,
-                            decode_times=False, concat_dim='time')
-    obs['time'].values = np.arange(obs.dims['time'])
-    obs['time'].encoding = {}
-    obs['time'].attrs = {}
-
+    # open files
+    obs = xr.open_mfdataset(obs_files, decode_times=False,
+                            concat_dim='time').drop('time')
     if kind == 'gard':
-        data, ref, new_fname = _gard_func(data, ref)
+        data, ref, new_fname = _gard_func(data_file, ref_file)
     elif kind == 'icar':
-        data, ref, new_fname = _icar_func(data, ref)
+        data, ref, new_fname = _icar_func(data_file, ref_file)
 
     qm_ds = xr.Dataset()
     for var in variables:

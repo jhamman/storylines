@@ -1,3 +1,7 @@
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
 import os
 import itertools
 from dateutil.relativedelta import relativedelta
@@ -7,8 +11,8 @@ import dask
 import dask.multiprocessing
 import pandas as pd
 import xarray as xr
-from scipy.special import cbrt
-from scipy.stats import norm
+from scipy.special import cbrt as _cbrt
+from scipy.stats import norm as norm
 
 from netCDF4 import num2date
 from xarray.conventions import nctime_to_nptime
@@ -27,6 +31,18 @@ reindex_dates = {
                           dims='time', name='time'),
     'rcp85': xr.DataArray(pd.date_range('2006-01-01', '2099-12-31', freq='D'),
                           dims='time', name='time')}
+
+
+def cbrt(data):
+    '''parallized version of scipy cube root'''
+    return xr.apply_ufunc(_cbrt, data, dask='parallelized',
+                          output_dtypes=[data.dtype])
+
+
+def ppf(data):
+    '''parallized version of scipy cube root'''
+    return xr.apply_ufunc(norm.ppf, data, dask='parallelized',
+                          output_dtypes=[data.dtype])
 
 
 def _get_units_from_drange(d):
@@ -60,8 +76,7 @@ def get_rand_ds(rand_file, chunks=None, calendar='standard',
     return rand_ds
 
 
-def add_random_effect(ds, da_normal, da_uniform=None, var=None, root=1.,
-                      logistic_thresh=None):
+def add_random_effect(ds, da_normal, da_uniform=None, var=None, root=1.):
     '''Add random effects to dataset `ds`
 
     Parameters
@@ -85,7 +100,7 @@ def add_random_effect(ds, da_normal, da_uniform=None, var=None, root=1.,
         Like `ds[var]` except da_errors includes random effects.
     '''
 
-    t0, t1 = str(ds.time.data[0]), str(ds.time.data[-1])
+    t0, t1 = str(ds.indexes['time'][0]), str(ds.indexes['time'][-1])
 
     da = ds[var]
     da_errors = ds['{}_error'.format(var)]
@@ -99,39 +114,30 @@ def add_random_effect(ds, da_normal, da_uniform=None, var=None, root=1.,
         # Get the exceedence variable (e.g. POP)
         da_ex = ds[exceedence_var]
 
-        # Allocate a few arrays
-        new_uniform = xr.zeros_like(r_uniform)
-        r_normal = xr.zeros_like(r_uniform)
-
         # Mask where precip occurs
         mask = r_uniform > (1 - da_ex)
 
         # Rescale the uniform distribution
-        new_uniform = ((r_uniform - 1) / da_ex) + 1
+        new_uniform = (r_uniform - (1 - da_ex)) / da_ex
 
-        # Where precip occurs, get the normal distribution equivalent of
-        # new_uniform
-        # r_normal.data[mask] = norm.ppf(new_uniform.data[mask])
-        r_normal = new_uniform.pipe(norm.ppf)
+        # Get the normal distribution equivalent of new_uniform
+        r_normal = ppf(new_uniform)
     else:
         mask = None
         r_normal = da_normal.sel(time=slice(t0, t1))
 
+    # apply the errors in transform space
     if root == 1.:
         da_errors = da + (da_errors * r_normal)
     elif root == 3:
-        if isinstance(da.data, dask.array.Array):
-            da_errors.data = (dask.array.map_blocks(cbrt, da.data) +
-                              (da_errors.data * r_normal.data)) ** root
-        else:
-            da_errors = (cbrt(da) + (da_errors * r_normal)) ** root
+        da_errors = (cbrt(da) + (da_errors * r_normal)) ** root
     else:
         da_errors = ((da ** (1./root)) + (da_errors * r_normal)) ** root
 
+    # if this var used logistic regression, apply that mask now
     if mask is not None:
-        da_errors.data = dask.array.where(mask, da_errors.data, 0)
-        da_errors.data = dask.array.maximum(da_errors.data, 0.)
-
+        valids = xr.ufuncs.logical_or(mask, da_errors >= 0)
+        da_errors = da_errors.where(valids, 0)
     return da_errors
 
 
