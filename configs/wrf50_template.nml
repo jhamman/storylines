@@ -1,0 +1,86 @@
+&parameters
+    output_file       = "{output_file_prefix}"
+
+    n_analogs         = {n_analogs}
+
+    start_date        = "{start_date}"
+    end_date          = "{end_date}"
+
+    start_train       = "{start_train}"
+    end_train         = "{end_train}"
+
+    start_transform   = "{start_transform}"
+    end_transform     = "{end_transform}"
+
+    start_post        = "{start_train}"
+    end_post          = "{end_train}"
+
+    pure_regression   = {pure_regression}
+    pure_analog       = {pure_analog}
+    analog_regression = {analog_regression}
+    pass_through      = {pass_through}
+
+    sample_analog      = {sample_analog}
+    weight_analogs     = {weight_analogs}
+    logistic_threshold = {logistic_threshold}
+    logistic_from_analog_exceedance = {logistic_from_analog_exceedance}
+
+    debug = False
+    interactive = False
+/
+
+&training_parameters
+    name = "Training data"
+    interpolation_method = 2
+    nvars     = {train_nvars}
+    data_type = "GCM"
+    lat_name  = "XLAT"
+    lon_name  = "XLONG"
+    time_name = "XTIME"
+    nfiles    = {train_nfiles}
+
+    input_transformations = {train_transform}
+    normalization_method = {normalization_method}
+
+    var_names = {train_vars}
+    file_list = {train_filelists}
+
+    selected_time = -1
+    calendar  = {train_calendar}
+/
+
+&prediction_parameters
+    name      = "Prediction data"
+    interpolation_method = 2
+    nvars     = {predict_nvars}
+    data_type = "GCM"
+    lat_name  = "XLAT"
+    lon_name  = "XLONG"
+    time_name = "XTIME"
+    nfiles    = {predict_nfiles}
+
+    transformations = {transformations}
+    input_transformations = {predict_transform}
+    normalization_method = {normalization_method}
+
+    var_names = {predict_vars}
+    file_list = {predict_filelists}
+    calendar  = {predict_calendar}
+/
+
+&obs_parameters
+    name      = "Obs data"
+    nvars     = {obs_nvars}
+    nfiles    = {obs_nfiles}
+    data_type = "obs"
+    lat_name  = "lat"
+    lon_name  = "lon"
+    time_name = "time"
+
+    input_transformations = {obs_transform}
+
+    var_names = {obs_vars}
+    file_list = {obs_filelists}
+    calendar  = {obs_calendar}
+
+/
