@@ -74,10 +74,11 @@ OUTPUT_TEMPLATE = \
 
 CHECK_TIMEVARS = True
 
-CUBE_ROOT_TRANSFORM = 3
-FIFTH_ROOT_TRANSFORM = 4
 NO_TRANSFORM = 0
 QUANTILE_TRANSFORM = 1
+LOG_TRANSFORM = 2
+CUBE_ROOT_TRANSFORM = 3
+FIFTH_ROOT_TRANSFORM = 4
 
 NO_NORM = 0
 SELF_NORM = 1
@@ -123,6 +124,7 @@ TRANSFORM = {'TMP_2maboveground': NO_TRANSFORM,
              'tmean_mean': NO_TRANSFORM,
              'T_RANGE': NO_TRANSFORM,
              't_range': NO_TRANSFORM,
+             'QVAPOR': NO_TRANSFORM,
              'PREC_TOT': p_transform,
              'rain_rate': p_transform,
              }
