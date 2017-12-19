@@ -168,7 +168,7 @@ filelistkey = namedtuple('filelistkey',
 
 
 # -------------------------------------------------------------------------#
-def run(config, outfile):
+def run(config_file, outfile):
     """
     Generate high-resolution meteorologic forcings by downscaling the GCM
     and/or RCM using the Generalized Analog Regression Downscaling (GARD) tool.
@@ -178,7 +178,7 @@ def run(config, outfile):
     TODO: Add sample config
     """
     # Read configuration file into a dictionary
-    config = read_config(config)
+    config = read_config(config_file)
 
     log_level = config['Options']['LogLevel']
     chunk_years = relativedelta(years=int(config['Options']['ChunkYears']))
@@ -408,9 +408,9 @@ def run(config, outfile):
     with open(outfile, 'w') as f:
         f.writelines('\n'.join(namelists))
 
-    config = os.path.join(data_dir, os.path.basename(config))
-    logger.info('writing config file %s', config)
-    shutil.copyfile(config, config)
+    config_copy = os.path.join(data_dir, os.path.basename(config_file))
+    logger.info('writing config file %s', config_copy)
+    shutil.copyfile(config_file, config_copy)
 
     return
 
