@@ -24,6 +24,7 @@ dependencies:
   - rasterio
   - h5py
   - cdo
+  - configobj
   # Plotting and visualization
   - matplotlib
   - seaborn
@@ -32,3 +33,5 @@ dependencies:
   # Testing
   - pytest
   - flake8
+  - pip:
+    - git+https://github.com/UW-Hydro/tonic.git

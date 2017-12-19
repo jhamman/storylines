@@ -1,3 +1,7 @@
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
 import sys
 import socket
 import time as time_mod
@@ -16,17 +20,12 @@ attrs = {'pcp': {'units': 'mm', 'long_name': 'precipitation',
          'mask': {'long_name': 'domain mask', 'note': 'unitless',
                   'comment': '0 value indicates cell is not active'}}
 
-encoding = {'pcp': {'dtype': 'f4', '_FillValue': -9999, 'zlib': True,
-                    'complevel': 1},
-            't_mean': {'dtype': 'f4', '_FillValue': -9999, 'zlib': True,
-                       'complevel': 1},
-            't_range': {'dtype': 'f4', '_FillValue': -9999, 'zlib': True,
-                        'complevel': 1},
-            't_min': {'dtype': 'f4', '_FillValue': -9999, 'zlib': True,
-                      'complevel': 1},
-            't_max': {'dtype': 'f4', '_FillValue': -9999, 'zlib': True,
-                      'complevel': 1},
-            'mask': {'zlib': True, 'complevel': 3}}
+encoding = {'pcp': {'dtype': 'f4', '_FillValue': -9999},  # 'zlib': True, # 'complevel': 1},
+            't_mean': {'dtype': 'f4', '_FillValue': -9999},  # 'zlib': True, # 'complevel': 1},
+            't_range': {'dtype': 'f4', '_FillValue': -9999},  # 'zlib': True, # 'complevel': 1},
+            't_min': {'dtype': 'f4', '_FillValue': -9999},  # 'zlib': True, # 'complevel': 1},
+            't_max': {'dtype': 'f4', '_FillValue': -9999},  # 'zlib': True, # 'complevel': 1},
+            'mask': {}}  # 'zlib': True, 'complevel': 3}}
 
 
 def make_gloabl_attrs(**kwargs):

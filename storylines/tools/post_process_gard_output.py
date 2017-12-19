@@ -1,14 +1,16 @@
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
 import os
 import itertools
 from dateutil.relativedelta import relativedelta
 
 import numpy as np
-import dask
-import dask.multiprocessing
 import pandas as pd
 import xarray as xr
-from scipy.special import cbrt
-from scipy.stats import norm
+from scipy.special import cbrt as _cbrt
+from scipy.stats import norm as norm
 
 from netCDF4 import num2date
 from xarray.conventions import nctime_to_nptime
@@ -27,6 +29,20 @@ reindex_dates = {
                           dims='time', name='time'),
     'rcp85': xr.DataArray(pd.date_range('2006-01-01', '2099-12-31', freq='D'),
                           dims='time', name='time')}
+
+raw_chunks = {'x': 58, 'y': 56}
+
+
+def cbrt(data):
+    '''parallized version of scipy cube root'''
+    return xr.apply_ufunc(_cbrt, data, dask='parallelized',
+                          output_dtypes=[data.dtype])
+
+
+def ppf(data):
+    '''parallized version of scipy cube root'''
+    return xr.apply_ufunc(norm.ppf, data, dask='parallelized',
+                          output_dtypes=[data.dtype])
 
 
 def _get_units_from_drange(d):
@@ -47,7 +63,7 @@ def make_gard_like_obs(ds, domain):
     ds.coords['lon'] = domain['lon']
     ds.coords['lat'] = domain['lat']
 
-    return ds.merge(domain)
+    return ds
 
 
 def get_rand_ds(rand_file, chunks=None, calendar='standard',
@@ -60,8 +76,7 @@ def get_rand_ds(rand_file, chunks=None, calendar='standard',
     return rand_ds
 
 
-def add_random_effect(ds, da_normal, da_uniform=None, var=None, root=1.,
-                      logistic_thresh=None):
+def add_random_effect(ds, da_normal, da_uniform=None, var=None, root=1.):
     '''Add random effects to dataset `ds`
 
     Parameters
@@ -85,7 +100,7 @@ def add_random_effect(ds, da_normal, da_uniform=None, var=None, root=1.,
         Like `ds[var]` except da_errors includes random effects.
     '''
 
-    t0, t1 = str(ds.time.data[0]), str(ds.time.data[-1])
+    t0, t1 = str(ds.indexes['time'][0]), str(ds.indexes['time'][-1])
 
     da = ds[var]
     da_errors = ds['{}_error'.format(var)]
@@ -99,39 +114,30 @@ def add_random_effect(ds, da_normal, da_uniform=None, var=None, root=1.,
         # Get the exceedence variable (e.g. POP)
         da_ex = ds[exceedence_var]
 
-        # Allocate a few arrays
-        new_uniform = xr.zeros_like(r_uniform)
-        r_normal = xr.zeros_like(r_uniform)
-
         # Mask where precip occurs
         mask = r_uniform > (1 - da_ex)
 
         # Rescale the uniform distribution
-        new_uniform = ((r_uniform - 1) / da_ex) + 1
+        new_uniform = (r_uniform - (1 - da_ex)) / da_ex
 
-        # Where precip occurs, get the normal distribution equivalent of
-        # new_uniform
-        # r_normal.data[mask] = norm.ppf(new_uniform.data[mask])
-        r_normal = new_uniform.pipe(norm.ppf)
+        # Get the normal distribution equivalent of new_uniform
+        r_normal = ppf(new_uniform)
     else:
         mask = None
         r_normal = da_normal.sel(time=slice(t0, t1))
 
+    # apply the errors in transform space
     if root == 1.:
         da_errors = da + (da_errors * r_normal)
     elif root == 3:
-        if isinstance(da.data, dask.array.Array):
-            da_errors.data = (dask.array.map_blocks(cbrt, da.data) +
-                              (da_errors.data * r_normal.data)) ** root
-        else:
-            da_errors = (cbrt(da) + (da_errors * r_normal)) ** root
+        da_errors = (cbrt(da) + (da_errors * r_normal)) ** root
     else:
         da_errors = ((da ** (1./root)) + (da_errors * r_normal)) ** root
 
+    # if this var used logistic regression, apply that mask now
     if mask is not None:
-        da_errors.data = dask.array.where(mask, da_errors.data, 0)
-        da_errors.data = dask.array.maximum(da_errors.data, 0.)
-
+        valids = xr.ufuncs.logical_or(mask, da_errors >= 0)
+        da_errors = da_errors.where(valids, 0)
     return da_errors
 
 
@@ -209,13 +215,12 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
             pre = template.format(se=se, drange=drange, scen=scen)
 
             fname = pre + '{}.nc'.format(var)
-            ds = xr.open_dataset(fname)
+            ds = xr.open_dataset(fname, chunks=raw_chunks)
             fname = pre + '{}_errors.nc'.format(var)
-            ds.merge(xr.open_dataset(fname),
-                     inplace=True)
+            ds = ds.merge(xr.open_dataset(fname, chunks=raw_chunks))
             try:
                 fname = pre + '{}_logistic.nc'.format(var)
-                ds.merge(xr.open_dataset(fname), inplace=True)
+                ds.merge(xr.open_dataset(fname, chunks=raw_chunks))
                 exceedence_var = True
             except (FileNotFoundError, OSError):
                 pass
@@ -227,12 +232,18 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
                                           units, calendar=calendar)))
 
             ds_list.append(ds)
-        ds = xr.concat(ds_list, dim='time').chunk(chunks=chunks)
 
-        ds = ds.reindex_like(reindex_dates[scen])
-        ds[var] = ds[var].interpolate_na(
-            dim='time', kind='index', fill_value='extrapolate')
-        calendar = 'standard'
+        ds = xr.concat(ds_list, dim='time')
+
+        for v in ['mask', 'elevation']:
+            if v in obs_ds:
+                ds[v] = obs_ds[v]
+
+        # ds = ds.reindex_like(reindex_dates[scen])
+        ds = ds.chunk(chunks=dict(time=ds.dims['time'], **chunks))
+        # ds[var] = ds[var].interpolate_na(
+        #     dim='time', kind='index', fill_value='extrapolate')
+        # calendar = 'standard'
 
         if rename_vars is not None and var in rename_vars:
             rename_dict = {}
@@ -266,8 +277,7 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
 
         # QC data after adding random effects
         if var in ['pcp', 't_range']:
-            da_errors.data = dask.array.where(da_errors.data > 0.,
-                                              da_errors.data, 0)
+            da_errors = xr.where(da_errors > 0., da_errors, 0)
 
         ds_out[var] = da_errors
         ds_out[var].attrs.update(attrs[var])
@@ -287,12 +297,13 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
     return ds_out
 
 
-def run(config_file, gcms=None, sets=None, variables=None):
+def run(config_file, gcms=None, sets=None, variables=None,
+        return_processed=False):
 
     config = read_config(config_file)
 
     # Define variables from configuration file
-    if variables is None:
+    if not variables:
         variables = list_like(config['PostProc']['variables'])
     roots = config['PostProc']['roots']
     rand_vars = config['PostProc']['rand_vars']
@@ -307,20 +318,23 @@ def run(config_file, gcms=None, sets=None, variables=None):
     for d in [data_dir, processed_dir]:
         os.makedirs(d, exist_ok=True)
 
+    out = {}  # for when return_processed==True
+
     chunk_years = relativedelta(years=int(config['Options']['ChunkYears']))
 
     # Get obs dataset
-    obs_ds = xr.open_dataset(config['Obs_Dataset']['ObsInputPattern'],
+    obs_ds = xr.open_dataset(config['ObsDataset']['ObsInputPattern'],
                              chunks=chunks)
-    obs_mask = (obs_ds['pcp'].isel(time=0, drop=True) >= 0)
+    obs_mask = obs_ds['mask']
 
     for dataset, dset_config in config['Datasets'].items():
 
-        if sets is None:
-            run_sets = list_like(dset_config['RunSets'])
+        if not sets:
+            run_sets = list_like(dset_config.get('RunSets',
+                                 config['Sets'].keys()))
         else:
             run_sets = sets
-        if gcms is None:
+        if not gcms:
             run_gcms = list_like(dset_config['GCMs'])
         else:
             # get the intersection of gcms with this dataset's config
@@ -335,11 +349,15 @@ def run(config_file, gcms=None, sets=None, variables=None):
             run_gcms = ['{0:03}'.format(i) for i in run_gcms]
 
         for gcm, setname in itertools.product(run_gcms, run_sets):
-
+            print(gcm, setname)
             calendar = config['Calendars'].get(
                 gcm, config['Calendars'].get('all', 'standard'))
 
             rand_calendar = 'standard'  # TODO: get this from PostProc dict
+
+            # Get random dataset
+            rand_ds = get_rand_ds(rand_file, chunks=chunks,
+                                  calendar=rand_calendar)
 
             for scen, drange in dset_config['scenario'].items():
 
@@ -362,9 +380,8 @@ def run(config_file, gcms=None, sets=None, variables=None):
                 # mm_fname_out = pre + 'mm.nc'
                 dm_fname_out = pre + 'dm.nc'
 
-                # Get random dataset
-                rand_ds = get_rand_ds(rand_file, chunks=chunks,
-                                      calendar=rand_calendar)
+                if not return_processed and os.path.isfile(dm_fname_out):
+                    continue
 
                 ds_out = process_gard_output(
                     setname, scen, periods, obs_ds, rand_ds,
@@ -384,5 +401,16 @@ def run(config_file, gcms=None, sets=None, variables=None):
 
                 ds_out.attrs = make_gloabl_attrs(
                     title='Post-processed GARD output downscaled dataset')
-                ds_out.to_netcdf(dm_fname_out, unlimited_dims=['time'],
-                                 format='NETCDF4', encoding=out_encoding)
+
+                if return_processed:
+                    out[dm_fname_out] = ds_out
+                else:
+                    print('writing %s' % dm_fname_out)
+                    ds_out.load().to_netcdf(dm_fname_out,
+                                            unlimited_dims=['time'],
+                                            format='NETCDF4',
+                                            encoding=out_encoding,
+                                            engine='h5netcdf')
+
+    if return_processed:
+        return out

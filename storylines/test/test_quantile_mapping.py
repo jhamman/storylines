@@ -1,3 +1,7 @@
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
 import numpy as np
 import dask.array as da
 import pandas as pd
@@ -9,6 +13,10 @@ from storylines.tools.quantile_mapping import (calc_endpoints,
                                                plotting_positions,
                                                quantile_mapping,
                                                make_x_and_y, remove_trend)
+
+from storylines.tools.post_process_gard_output import make_gard_like_obs
+
+from .test_data import get_test_data, requires_test_data
 
 
 def test_calc_endpoints():
@@ -113,17 +121,6 @@ def test_quantile_mapping_dask(ex, detrend):
     assert new.dims == input_data.dims
 
 
-# def test_qmap_wrapper():
-#
-#     # input arrays
-#     a = da.random.random((400, 16, 21), chunks=(400, 4, 7))
-#     b = da.random.random((300, 16, 21), chunks=(300, 4, 7))
-#     c = da.random.random((200, 16, 21), chunks=(200, 4, 7))
-#     d = da.random.random((16, 21), chunks=(4, 7)) > 0.5  # boolean mask
-#
-#     da.map_blocks(_qmap_wrapper, a, b, c, d, dtype=a.dtype, chunks=a.chunks,
-#                   extrapolate='min').compute()
-
 def test_remove_trend():
     input_data = xr.DataArray(
         da.random.random((400, 16, 21), chunks=(400, 4, 3)),
@@ -153,3 +150,17 @@ def test_make_x_and_y():
         x, y, s = make_x_and_y(y, 0.4, 0.4, ex)
         assert len(x) == n + add
         assert np.all(np.diff(x) >= 0)  # monotonically increasing
+
+
+@requires_test_data
+def test_with_real_data():
+    gard_ds = get_test_data('gard')
+    domain = get_test_data('domain')
+    obs = get_test_data('obs_stacked')
+    print('obs', obs)
+
+    gard_ds['time'] = pd.date_range('1950-01-01', freq='D',
+                                    periods=len(gard_ds['time']))
+    gard_ds = make_gard_like_obs(gard_ds, domain)
+
+    quantile_mapping(gard_ds['pcp'], None, obs['pcp'], use_ref_data=False)
