@@ -13,9 +13,12 @@ dependencies:
   # I/O
   - netcdf4
   - pynio
-  - h5netcdf 
+  - h5netcdf
+  - configobj
 # Plotting and visualization
   - matplotlib
   - seaborn
   - cartopy
   - bokeh
+  - pip:
+    - git+https://github.com/UW-Hydro/tonic.git

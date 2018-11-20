@@ -1,69 +1,98 @@
-#!/usr/bin/env python
-import argparse
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
 
-# import numpy as np
-import dask
-import dask.array as np
+import os
+import itertools
+from dateutil.relativedelta import relativedelta
+
+import numpy as np
+import pandas as pd
 import xarray as xr
-from scipy.special import cbrt
+from scipy.special import cbrt as _cbrt
+from scipy.stats import norm as norm
 
 from netCDF4 import num2date
 from xarray.conventions import nctime_to_nptime
 
-from .gard_utils import read_config
+from storylines.tools.gard_utils import (read_config, get_drange_chunks,
+                                         list_like, _tslice_to_str)
+from storylines.tools.encoding import attrs, encoding, make_gloabl_attrs
 
-attrs = {'pcp': {'units': 'mm', 'long_name': 'precipitation',
-                 'comment': 'random effects applied'},
-         't_mean': {'units': 'C', 'long_name': 'air temperature',
-                    'comment': 'random effects applied'},
-         't_range': {'units': 'C', 'long_name': 'daily air temperature range',
-                     'comment': 'random effects applied'},
-         't_min': {'units': 'C', 'long_name': 'minimum daily air temperature',
-                   'comment': 'random effects applied'},
-         't_max': {'units': 'C', 'long_name': 'maximum daily air temperature',
-                   'comment': 'random effects applied'}}
+PASS_THROUGH_PCP_MULT = 24  # units mm/hr to mm/day
+KELVIN = 273.15
 
-encoding = {'pcp': {'_FillValue': -9999},
-            't_mean': {'_FillValue': -9999},
-            't_range': {'_FillValue': -9999},
-            't_min': {'_FillValue': -9999},
-            't_max': {'_FillValue': -9999}}
+reindex_dates = {
+    'hist': xr.DataArray(pd.date_range('1950-01-01', '2005-12-31', freq='D'),
+                         dims='time', name='time'),
+    'rcp45': xr.DataArray(pd.date_range('2006-01-01', '2099-12-31', freq='D'),
+                          dims='time', name='time'),
+    'rcp85': xr.DataArray(pd.date_range('2006-01-01', '2099-12-31', freq='D'),
+                          dims='time', name='time')}
+
+raw_chunks = {'x': 58, 'y': 56}
+
+
+def cbrt(data):
+    '''parallized version of scipy cube root'''
+    return xr.apply_ufunc(_cbrt, data, dask='parallelized',
+                          output_dtypes=[data.dtype])
+
+
+def ppf(data):
+    '''parallized version of scipy cube root'''
+    return xr.apply_ufunc(norm.ppf, data, dask='parallelized',
+                          output_dtypes=[data.dtype])
 
 
 def _get_units_from_drange(d):
-    return 'days since %s-%s-%s' % (d[:4], d[4:6], d[6:8])
+
+    dsplit = d.split('-')
+
+    if len(dsplit) <= 2:
+        # e.g. `d = 19200101-19291231` or just `d = 19200101`
+        return 'days since {0}-{1}-{2}'.format(d[:4], d[4:6], d[6:8])
+    else:
+        # e.g. `d = 1920-01-01`
+        return 'days since {:04}-{:02}-{:02}'.format(*map(int, dsplit))
 
 
-def make_gard_like_obs(ds, obs, mask=None):
+def make_gard_like_obs(ds, domain):
 
     ds = ds.rename({'x': 'lon', 'y': 'lat'})
-    ds.coords['lon'] = obs['lon']
-    ds.coords['lat'] = obs['lat']
-
-    if mask is not None:
-        ds = ds.where(mask)
+    ds.coords['lon'] = domain['lon']
+    ds.coords['lat'] = domain['lat']
 
     return ds
 
 
-def add_random_effect(ds, da_rand, var=None, root=1.,
-                      is_precip=False, pop_thresh=None):
+def get_rand_ds(rand_file, chunks=None, calendar='standard',
+                units='days since 1950-01-01'):
+    rand_ds = xr.open_dataset(rand_file, chunks=chunks)
+    rand_ds['time'] = nctime_to_nptime(
+        num2date(np.arange(0, rand_ds.dims['time']), units,
+                 calendar=calendar))
+
+    return rand_ds
+
+
+def add_random_effect(ds, da_normal, da_uniform=None, var=None, root=1.):
     '''Add random effects to dataset `ds`
 
     Parameters
     ----------
     ds : xarray.Dataset
         Input dataset with variables variable (e.g. `tas`) and error terms.
-        if `is_precip=True`, must also include `pcp_exceedence_probability`
-        variable.
-    da_rand : xarray.DataArray
-        Input spatially correlated random field
+        If `{var}_exceedence_probability` is a variable in ``ds``, it will also
+        be applied to the error term.
+    da_normal : xarray.DataArray
+        Input spatially correlated random field (normal distribution)
+    da_uniform : xarray.DataArray
+        Input spatially correlated random field (uniform distribution)
+    var : str
+        Variable name in ``ds`` that random effects will be added to
     root : float
         Root used to transform
-    is_precip : bool
-        True if the quantity being calculated is precipitation
-    pop_thresh : float or xr.DataArray
-        Threshold value for POP (required if `is_precip==True`).
 
     Returns
     -------
@@ -71,38 +100,44 @@ def add_random_effect(ds, da_rand, var=None, root=1.,
         Like `ds[var]` except da_errors includes random effects.
     '''
 
-    t0, t1 = str(ds.time.data[0]), str(ds.time.data[-1])
+    t0, t1 = str(ds.indexes['time'][0]), str(ds.indexes['time'][-1])
 
-    e_var = '{}_error'.format(var)
-    rand = da_rand.sel(time=slice(t0, t1))
-    if root == 1.:
-        da_errors = ds[var] + (ds[e_var] * rand)
-    if False:  # root == 3:
-        if isinstance(ds[var].data, dask.array.Array):
-            da_errors = (np.map_blocks(cbrt, ds[var]) +
-                         (ds[e_var] * rand)) ** root
-        else:
-            da_errors = (cbrt(ds[var]) + (ds[e_var] * rand)) ** root
+    da = ds[var]
+    da_errors = ds['{}_error'.format(var)]
+
+    exceedence_var = '{}_exceedence_probability'.format(var)
+    if exceedence_var in ds:
+
+        # Get the array of uniform errors
+        r_uniform = da_uniform.sel(time=slice(t0, t1))
+
+        # Get the exceedence variable (e.g. POP)
+        da_ex = ds[exceedence_var]
+
+        # Mask where precip occurs
+        mask = r_uniform > (1 - da_ex)
+
+        # Rescale the uniform distribution
+        new_uniform = (r_uniform - (1 - da_ex)) / da_ex
+
+        # Get the normal distribution equivalent of new_uniform
+        r_normal = ppf(new_uniform)
     else:
-        da_errors = ((ds[var] ** (1./root)) + (ds[e_var] * rand)) ** root
+        mask = None
+        r_normal = da_normal.sel(time=slice(t0, t1))
 
-    if is_precip:
-        da_pop = ds['{}_exceedence_probability'.format(var)]
+    # apply the errors in transform space
+    if root == 1.:
+        da_errors = da + (da_errors * r_normal)
+    elif root == 3:
+        da_errors = (cbrt(da) + (da_errors * r_normal)) ** root
+    else:
+        da_errors = ((da ** (1./root)) + (da_errors * r_normal)) ** root
 
-        if isinstance(pop_thresh, float):
-            # mask where POP is less than the threshold
-            da_errors.data = np.where(da_pop.data > pop_thresh.data,
-                                      da_errors.data, 0)
-        elif isinstance(pop_thresh, (xr.DataArray)):
-            t0, t1 = str(ds.time.data[0]), str(ds.time.data[-1])
-            # mask where POP is less than a uniform transform of rand
-            p_rand_uniform = pop_thresh.sel(time=slice(t0, t1))
-            da_errors.data = np.where(np.logical_and(
-                da_pop.data > (1 - p_rand_uniform.data),
-                da_errors.data > 0), da_errors.data, 0)
-        else:
-            raise TypeError('cannot apply POP mask with %s' % type(pop_thresh))
-
+    # if this var used logistic regression, apply that mask now
+    if mask is not None:
+        valids = xr.ufuncs.logical_or(mask, da_errors >= 0)
+        da_errors = da_errors.where(valids, 0)
     return da_errors
 
 
@@ -114,8 +149,47 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
                         roots={'pcp': 3., 't_mean': 1, 't_range': 1},
                         rand_vars={'pcp': 'p_rand', 't_mean': 't_rand',
                                    't_range': 't_rand'},
-                        quantile_mapping=False, chunks=None):
+                        chunks=None):
 
+    '''Top level function for processing raw gard output
+
+    Parameters
+    ----------
+    se : str
+        Set name
+    scen : str
+        Scenario name
+    periods : list of str
+        List of periods (e.g. ['19200101-19291231', '19300101-19391231'])
+    obs_ds : xr.Dataset
+        Dataset with observations
+    rand_ds : xr.Dataset
+        Dataset with random fields
+    template : str
+        Filepath template string
+    obs_mask : xr.DataArray
+        Mask to apply to GARD datasets (optional)
+    calendar : str
+        Calendar to use for time coordinates
+    variables : list of str
+        List of variable names to process
+    rename_vars : dict
+        Dictionary mapping from ``variables`` to obs variable names
+    roots : dict
+        Dictionary of transform roots
+    rand_vars : dict
+        Dictionary mapping from ``variables`` to ``rand_ds`` variable names
+
+    Returns
+    -------
+    ds : xr.Dataset
+        Post processed GARD dataset
+
+    See Also
+    --------
+    add_random_effect
+    make_gard_like_obs
+    '''
     if not isinstance(obs_ds, xr.Dataset):
         # we'll assume that obs_ds is a string/path/or something that
         # xr.open_dataset can open, if not, we'll raise an error right away
@@ -128,128 +202,215 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
         rand_ds = xr.open_dataset(rand_ds, chunks=chunks)
 
     ds_out = xr.Dataset()
-    for var in variables:
 
+    if rename_vars is not None:
+        rename_dict = rename_vars.copy()
+
+    for var in variables:
+        exceedence_var = False
         ds_list = []
         for drange in periods:
 
+            drange = _tslice_to_str(drange)
             pre = template.format(se=se, drange=drange, scen=scen)
 
-            ds = xr.open_dataset(pre + '{}.nc'.format(var))
-            ds.merge(xr.open_dataset(pre + '{}_errors.nc'.format(var)),
-                     inplace=True)
+            fname = pre + '{}.nc'.format(var)
+            ds = xr.open_dataset(fname, chunks=raw_chunks)
+            fname = pre + '{}_errors.nc'.format(var)
+            ds = ds.merge(xr.open_dataset(fname, chunks=raw_chunks))
             try:
-                ds.merge(xr.open_dataset(pre + '{}_logistic.nc'.format(var)),
-                         inplace=True)
-                is_precip = True
+                fname = pre + '{}_logistic.nc'.format(var)
+                ds.merge(xr.open_dataset(fname, chunks=raw_chunks))
+                exceedence_var = True
             except (FileNotFoundError, OSError):
-                is_precip = False
+                pass
 
             ds = make_gard_like_obs(ds, obs_ds)
-            if chunks is not None:
-                ds = ds.chunk(chunks=chunks)
-
             units = _get_units_from_drange(drange)
-            ds['time'] = nctime_to_nptime(
-                num2date(np.arange(0, ds.dims['time'], chunks=ds.dims['time']),
-                         units, calendar=calendar))
+            ds['time'] = pd.DatetimeIndex(
+                nctime_to_nptime(num2date(np.arange(0, ds.dims['time']),
+                                          units, calendar=calendar)))
 
             ds_list.append(ds)
+
         ds = xr.concat(ds_list, dim='time')
 
+        for v in ['mask', 'elevation']:
+            if v in obs_ds:
+                ds[v] = obs_ds[v]
+
+        # ds = ds.reindex_like(reindex_dates[scen])
+        ds = ds.chunk(chunks=dict(time=ds.dims['time'], **chunks))
+        # ds[var] = ds[var].interpolate_na(
+        #     dim='time', kind='index', fill_value='extrapolate')
+        # calendar = 'standard'
+
         if rename_vars is not None and var in rename_vars:
-            rename_dict = rename_vars.copy()
-            rename_dict['{}_error'.format(var)] = '{}_error'.format(rename_vars[var])
-            rename_dict['{}_exceedence_probability'.format(var)] = '{}_exceedence_probability'.format(rename_vars[var])
+            rename_dict = {}
+            rename_dict[var] = rename_vars[var]
+            ervar = '{}_error'.format(rename_vars[var])
+            rename_dict['{}_error'.format(var)] = ervar
+            if exceedence_var:
+                exvar = '{}_exceedence_probability'.format(rename_vars[var])
+                rename_dict['{}_exceedence_probability'.format(var)] = exvar
             ds = ds.rename(rename_dict)
-            var = rename_vars[var]
+            var = rename_dict[var]
 
-        assert var in attrs
-        assert var in encoding
+        t0 = str(ds.coords['time'].data[0])
+        t1 = str(ds.coords['time'].data[-1])
+        rand_ds = rand_ds.sel(time=slice(t0, t1))
 
-        if se is not 'pass_through':
-            # TODO: add additional args
-            if is_precip:
-                pop_thresh = rand_ds['p_rand_uniform']
-            else:
-                pop_thresh = None
-
+        if se != 'pass_through':
             root = roots[var]
             rand_var = rand_vars[var]
             da_errors = add_random_effect(ds, rand_ds[rand_var],
-                                          var=var, root=root,
-                                          is_precip=is_precip,
-                                          pop_thresh=pop_thresh)
+                                          rand_ds['p_rand_uniform'],
+                                          var=var, root=root)
+
         else:
-            da_errors = ds[var]
+            if var == 'pcp':
+                da_errors = ds[var] * PASS_THROUGH_PCP_MULT
+            elif var == 't_mean':
+                da_errors = ds[var] - KELVIN
+            else:
+                da_errors = ds[var]
 
-        t0 = str(da_errors.coords['time'].data[0])
-        t1 = str(da_errors.coords['time'].data[-1])
+        # QC data after adding random effects
+        if var in ['pcp', 't_range']:
+            da_errors = xr.where(da_errors > 0., da_errors, 0)
 
-        if quantile_mapping:
-            # offset zeros in GARD data for precip
-            # TODO: update this with new dask/xarray where
-            if is_precip:
-                da_errors.data = np.where(
-                    da_errors.data > 0,  # where precip is non-zero
-                    da_errors.data + 1,  # add 1
-                    rand_ds['p_rand_uniform'].sel(time=slice(t0, t1)).data)
-
-            # Quantile mapping
-            da_errors = quantile_mapping(da_errors, obs_ds[var],
-                                         mask=obs_mask)
         ds_out[var] = da_errors
-        ds_out[var].attrs = attrs[var]
-        ds_out[var].encoding = encoding[var]
+        ds_out[var].attrs.update(attrs[var])
+        ds_out[var].encoding.update(encoding[var])
 
-    if 't_range' in variables and 't_mean' in variables:
-        ds_out['t_min'] = ds_out['t_mean'] - 0.5 * ds_out['t_range']
-        ds_out['t_max'] = ds_out['t_mean'] + 0.5 * ds_out['t_range']
-        for var in ['t_max', 't_min']:
-            ds_out[var].attrs = attrs[var]
-        ds_out = ds_out.drop('t_mean')
-
+    # mask sure the dataset is properly masked
     if obs_mask is not None:
         ds_out = ds_out.where(obs_mask)
+        ds_out['mask'] = obs_mask
+        ds_out['mask'].attrs = attrs['mask']
+        ds_out['mask'].encoding.update(encoding['mask'])
 
     # Add metadata
     ds_out['time'].encoding['calendar'] = calendar
     ds_out['time'].encoding['units'] = units
 
-    ds_out.info()
     return ds_out
 
 
-def command_line_tool():
-    parser = argparse.ArgumentParser(
-        description='Post Process GARD output')
-    parser.add_argument('config_file', metavar='config_file',
-                        help='configuration file for downscaling matrix')
-    parser.add_argument('--outdir', metavar='outdir', default=None,
-                        help='output directory for post processed files')
-    args = parser.parse_args()
+def run(config_file, gcms=None, sets=None, variables=None,
+        return_processed=False):
 
-    config = read_config(args.config_file)
+    config = read_config(config_file)
 
-    # move logic from notebook here
+    # Define variables from configuration file
+    if not variables:
+        variables = list_like(config['PostProc']['variables'])
+    roots = config['PostProc']['roots']
+    rand_vars = config['PostProc']['rand_vars']
+    rename_vars = config['PostProc']['rename_vars']
+    rand_file = config['PostProc']['rand_file']
 
-# drange = '{}-{}'.format(periods[0].split('-')[0],
-#                         periods[-1].split('-')[1])
-# pre = out_template.format(se=se, drange=drange, scen=scen)
-# mm_fname_out = pre + 'mm.nc'
-# dm_fname_out = pre + 'dm.nc'
-#
-# print(dm_fname_out)
-#
-# ds_out.resample('MS', dim='time', how='mean',
-#                 keep_attrs=True).to_netcdf(mm_fname_out, encoding=encoding,
-#                                            unlimited_dims=['time'])
-#
-# ds_out.to_netcdf(dm_fname_out, encoding=encoding, unlimited_dims=['time'])
+    chunks = config['PostProc'].get('chunks', None)
 
-    print(config)
+    # create directories if they don't exist yet
+    data_dir = config['Options']['DataDir']
+    processed_dir = os.path.join(data_dir, 'post_processed')
+    for d in [data_dir, processed_dir]:
+        os.makedirs(d, exist_ok=True)
 
+    out = {}  # for when return_processed==True
 
-if __name__ == '__main__':
-    print('post_process_gard_output')
-    command_line_tool()
+    chunk_years = relativedelta(years=int(config['Options']['ChunkYears']))
+
+    # Get obs dataset
+    obs_ds = xr.open_dataset(config['ObsDataset']['ObsInputPattern'],
+                             chunks=chunks)
+    obs_mask = obs_ds['mask']
+
+    for dataset, dset_config in config['Datasets'].items():
+
+        if not sets:
+            run_sets = list_like(dset_config.get('RunSets',
+                                 config['Sets'].keys()))
+        else:
+            run_sets = sets
+        if not gcms:
+            run_gcms = list_like(dset_config['GCMs'])
+        else:
+            # get the intersection of gcms with this dataset's config
+            run_gcms = list_like(set(gcms).intersection(
+                set(list_like(dset_config['GCMs']))))
+            run_gcms = list(run_gcms)
+            if not gcms:
+                print('skipping because this gcm isnt in the dataset config')
+                continue
+        if run_gcms and isinstance(run_gcms[0], int):
+            # work around for these being cast as ints
+            run_gcms = ['{0:03}'.format(i) for i in run_gcms]
+
+        for gcm, setname in itertools.product(run_gcms, run_sets):
+            print(gcm, setname)
+            calendar = config['Calendars'].get(
+                gcm, config['Calendars'].get('all', 'standard'))
+
+            rand_calendar = 'standard'  # TODO: get this from PostProc dict
+
+            # Get random dataset
+            rand_ds = get_rand_ds(rand_file, chunks=chunks,
+                                  calendar=rand_calendar)
+
+            for scen, drange in dset_config['scenario'].items():
+
+                template = os.path.join(
+                    data_dir, dataset,
+                    '{se}/{drange}/gard_output.{se}.%s.%s.{scen}.{drange}.' %
+                    (dataset, gcm))
+
+                out_template = os.path.join(
+                    processed_dir,
+                    'gard_output.{se}.%s.%s.{scen}.{drange}.' % (dataset, gcm))
+
+                periods = get_drange_chunks(tuple(drange),
+                                            max_chunk_size=chunk_years)
+
+                drange = '{}-{}'.format(periods[0][0].strftime('%Y%m%d'),
+                                        periods[-1][1].strftime('%Y%m%d'))
+                pre = out_template.format(se=setname, drange=drange,
+                                          scen=scen)
+                # mm_fname_out = pre + 'mm.nc'
+                dm_fname_out = pre + 'dm.nc'
+
+                if not return_processed and os.path.isfile(dm_fname_out):
+                    continue
+
+                ds_out = process_gard_output(
+                    setname, scen, periods, obs_ds, rand_ds,
+                    template=template,
+                    obs_mask=obs_mask,
+                    calendar=calendar,
+                    variables=variables,
+                    rename_vars=rename_vars,
+                    roots=roots,
+                    rand_vars=rand_vars,
+                    chunks=chunks)
+
+                out_encoding = {}
+                for key in ds_out.variables:
+                    out_encoding[key] = ds_out[key].encoding
+                    out_encoding[key].update(encoding.get(key, {}))
+
+                ds_out.attrs = make_gloabl_attrs(
+                    title='Post-processed GARD output downscaled dataset')
+
+                if return_processed:
+                    out[dm_fname_out] = ds_out
+                else:
+                    print('writing %s' % dm_fname_out)
+                    ds_out.load().to_netcdf(dm_fname_out,
+                                            unlimited_dims=['time'],
+                                            format='NETCDF4',
+                                            encoding=out_encoding,
+                                            engine='h5netcdf')
+
+    if return_processed:
+        return out
