@@ -61,6 +61,7 @@ def quantile_mapping(input_data, ref_data, data_to_match,
     '''
 
     if detrend:
+        print('detrending')
         # remove linear trend, saving the slope/intercepts for use later
         input_data, input_data_trend = remove_trend(input_data)
         data_to_match, _ = remove_trend(data_to_match)
@@ -70,8 +71,11 @@ def quantile_mapping(input_data, ref_data, data_to_match,
     # arguments to qmap
     kwargs = dict(alpha=alpha, beta=beta, extrapolate=extrapolate,
                   n_endpoints=n_endpoints)
+    print('kwargs: %s' % kwargs)
 
     new = qmap_grid(input_data, data_to_match, ref_data, **kwargs)
+
+    print('putting the trend back')
 
     # put the trend back
     if detrend:
@@ -325,23 +329,25 @@ def qmap(data, like, ref=None, alpha=0.4, beta=0.4, extrapolate=None,
     return new
 
 
-def _calc_slope(x, y):
+def _calc_slope(y):
     '''wrapper that returns the slop from a linear regression fit of x and y'''
+    x = np.arange(len(y))
     slope = stats.linregress(x, y)[0]  # extract slope only
     return slope
 
 
 def remove_trend(obj):
-    time_nums = xr.DataArray(obj['time'].values.astype(np.float),
-                             dims='time',
-                             coords={'time': obj['time']},
-                             name='time_nums')
-    trend = xr.apply_ufunc(_calc_slope, time_nums, obj,
+    time_nums = xr.DataArray(np.arange(len(obj['time']), dtype=float),
+                             dims=('time', ))
+
+    time_nums['time'] = obj['time']
+
+    trend = xr.apply_ufunc(_calc_slope, obj,
                            vectorize=True,
-                           input_core_dims=[['time'], ['time']],
+                           input_core_dims=[['time']],
                            output_core_dims=[[]],
                            output_dtypes=[np.float],
-                           dask='parallelized')
+                           )
 
     trend_ts = (time_nums * trend).transpose(*obj.dims)
     detrended = obj - trend_ts
@@ -385,21 +391,35 @@ def _inner_qmap_grid(data, like, ref, use_ref_data=False, **kwargs):
     return new
 
 
-def run(data_file, ref_file, obs_files, kind, variables):
+def run(data_file, ref_file, obs_files, kind, variables, lazy=True):
     """
     Wrapper around the quantile mapping functions in this module
     """
 
     # open files
-    obs = xr.open_mfdataset(obs_files, decode_times=False,
-                            concat_dim='time').drop('time')
     if kind == 'gard':
         data, ref, new_fname = _gard_func(data_file, ref_file)
     elif kind == 'icar':
         data, ref, new_fname = _icar_func(data_file, ref_file)
 
+    if lazy and os.path.isfile(new_fname):
+        print('%s already exists' % new_fname)
+        return
+
+    print('loading ds')
+    data = data.load()
+    print('ref_loading ref_ds')
+    ref = ref.load()
+    print('done')
+
+    obs = xr.open_mfdataset(obs_files.replace('\\', ''), decode_times=False,
+                            concat_dim='time').drop('time').load()
+
+    print('done with gard_func')
+
     qm_ds = xr.Dataset()
     for var in variables:
+        print('var: %s' % var)
         qm_ds[var] = quantile_mapping(
             data[var], ref[var], obs[var],
             detrend=detrend[var],
@@ -408,6 +428,8 @@ def run(data_file, ref_file, obs_files, kind, variables):
         if zeros[var]:
             # make sure a zero in the input data comes out as a zero
             qm_ds[var] = xr.where(data[var] <= 0, 0, qm_ds[var])
+
+        print('done with quantile mapping for var %s' % var)
 
     qm_ds['time'] = data['time']
 
@@ -429,15 +451,20 @@ def run(data_file, ref_file, obs_files, kind, variables):
 
     qm_ds.attrs = make_gloabl_attrs(title='Quantile mapped downscaled dataset')
 
+    print('writing %s' % new_fname)
+
     qm_ds.to_netcdf(new_fname, unlimited_dims=['time'],
                     format='NETCDF4', encoding=use_encoding)
 
 
 def _gard_func(data, ref):
-    data = xr.open_dataset(data)
 
-    if 't_mean' not in data and 't_min' in data and 't_max' in data:
-        data['t_mean'] = (data['t_min'] + data['t_max']) / 2
+    new_fname = data[:-3] + '.qm.nc'
+
+    ds = xr.open_dataset(data)
+
+    if 't_mean' not in ds and 't_min' in ds and 't_max' in ds:
+        ds['t_mean'] = (ds['t_min'] + ds['t_max']) / 2
 
     if ref == 'auto':
         template = 'gard_output.{gset}.{dset}.{gcm}.{scen}.{date_range}.dm.nc'
@@ -450,15 +477,17 @@ def _gard_func(data, ref):
                               scen='hist', date_range=ref_time[dset])
 
     if ref is not None and ref != data:
-        ref = xr.open_dataset(ref)
-        if 't_mean' not in ref and 't_min' in ref and 't_max' in ref:
-            ref['t_mean'] = (ref['t_min'] + ref['t_max']) / 2
+        ref_ds = xr.open_dataset(ref)
+        if 't_mean' not in ref_ds and 't_min' in ref_ds and 't_max' in ref_ds:
+            ref_ds['t_mean'] = (ref_ds['t_min'] + ref_ds['t_max']) / 2
     else:
-        ref = {v: None for v in data}
+        ref_ds = ds
 
-    new_fname = data[:-3] + '.qm.nc'
+    print('ds', ds)
+    print('ref_ds', ref_ds)
+    print('new_fname', new_fname, flush=True)
 
-    return data, ref, new_fname
+    return ds, ref_ds, new_fname
 
 
 def _icar_func(data, ref):
