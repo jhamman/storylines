@@ -445,6 +445,7 @@ def get_filelist(pattern, date_range=None, timevar='time', calendar=None):
                 else:
                     ds = xr.open_dataset(f, decode_cf=True, decode_times=True,
                                          **kwargs)
+
             except Exception as e:
                 warnings.warn('failed to open {}: {}'.format(f, e))
 
@@ -460,8 +461,13 @@ def get_filelist(pattern, date_range=None, timevar='time', calendar=None):
                     warnings.warn(
                         'time check raised an error for file %s: %s' % (f, e))
 
-            start = ds[timevar].values[0]
-            end = ds[timevar].values[-1]
+            # hack to allow comparison with normal datetime objects
+            try:
+                times = ds.indexes['time'].to_datetimeindex()
+            except AttributeError:
+                times = ds.indexes['time']
+            start = times.values[0]
+            end = times.values[-1]
             ds.close()
             if (((start >= date_range[0]) and (start <= date_range[1])) or
                     ((end >= date_range[0]) and (end <= date_range[1])) or

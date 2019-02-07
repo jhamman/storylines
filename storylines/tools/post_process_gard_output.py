@@ -6,14 +6,10 @@ import os
 import itertools
 from dateutil.relativedelta import relativedelta
 
-import numpy as np
-import pandas as pd
+# import pandas as pd
 import xarray as xr
 from scipy.special import cbrt as _cbrt
 from scipy.stats import norm as norm
-
-from netCDF4 import num2date
-from xarray.conventions import nctime_to_nptime
 
 from storylines.tools.gard_utils import (read_config, get_drange_chunks,
                                          list_like, _tslice_to_str)
@@ -22,15 +18,8 @@ from storylines.tools.encoding import attrs, encoding, make_gloabl_attrs
 PASS_THROUGH_PCP_MULT = 24  # units mm/hr to mm/day
 KELVIN = 273.15
 
-reindex_dates = {
-    'hist': xr.DataArray(pd.date_range('1950-01-01', '2005-12-31', freq='D'),
-                         dims='time', name='time'),
-    'rcp45': xr.DataArray(pd.date_range('2006-01-01', '2099-12-31', freq='D'),
-                          dims='time', name='time'),
-    'rcp85': xr.DataArray(pd.date_range('2006-01-01', '2099-12-31', freq='D'),
-                          dims='time', name='time')}
-
 raw_chunks = {'x': 58, 'y': 56}
+chunks = {'lat': raw_chunks['y'], 'lon': raw_chunks['x']}
 
 
 def cbrt(data):
@@ -45,33 +34,30 @@ def ppf(data):
                           output_dtypes=[data.dtype])
 
 
-def _get_units_from_drange(d):
+def tidy_gard(ds):
+    lat = ds['lat'].isel(x=0, drop=True).load()
+    if 'lon' in lat.coords:
+        lat = lat.drop('lon')
+    lon = ds['lon'].isel(y=0, drop=True).load()
+    if 'lat' in lon.coords:
+        lon = lon.drop('lat')
+    lon.values[lon.values > 180] -= 360
 
-    dsplit = d.split('-')
+    ds.coords['lat'] = lat
+    ds.coords['lon'] = lon
 
-    if len(dsplit) <= 2:
-        # e.g. `d = 19200101-19291231` or just `d = 19200101`
-        return 'days since {0}-{1}-{2}'.format(d[:4], d[4:6], d[6:8])
-    else:
-        # e.g. `d = 1920-01-01`
-        return 'days since {:04}-{:02}-{:02}'.format(*map(int, dsplit))
+    ds = ds.rename({'y': 'lat', 'x': 'lon'})
 
-
-def make_gard_like_obs(ds, domain):
-
-    ds = ds.rename({'x': 'lon', 'y': 'lat'})
-    ds.coords['lon'] = domain['lon']
-    ds.coords['lat'] = domain['lat']
+    ds = ds.sortby('time')
 
     return ds
 
 
 def get_rand_ds(rand_file, chunks=None, calendar='standard',
-                units='days since 1950-01-01'):
+                start='1950-01-01', freq='D'):
     rand_ds = xr.open_dataset(rand_file, chunks=chunks)
-    rand_ds['time'] = nctime_to_nptime(
-        num2date(np.arange(0, rand_ds.dims['time']), units,
-                 calendar=calendar))
+    rand_ds['time'] = xr.cftime_range(start, periods=rand_ds.dims['time'],
+                                      calendar=calendar, freq=freq)
 
     return rand_ds
 
@@ -99,8 +85,8 @@ def add_random_effect(ds, da_normal, da_uniform=None, var=None, root=1.):
     da_errors : xarray.DataArray
         Like `ds[var]` except da_errors includes random effects.
     '''
-
-    t0, t1 = str(ds.indexes['time'][0]), str(ds.indexes['time'][-1])
+    t0 = str(ds.indexes['time'][0].strftime('%Y-%m-%d'))
+    t1 = str(ds.indexes['time'][-1].strftime('%Y-%m-%d'))
 
     da = ds[var]
     da_errors = ds['{}_error'.format(var)]
@@ -127,7 +113,7 @@ def add_random_effect(ds, da_normal, da_uniform=None, var=None, root=1.):
         r_normal = da_normal.sel(time=slice(t0, t1))
 
     # apply the errors in transform space
-    if root == 1.:
+    if root == 1:
         da_errors = da + (da_errors * r_normal)
     elif root == 3:
         da_errors = (cbrt(da) + (da_errors * r_normal)) ** root
@@ -138,10 +124,11 @@ def add_random_effect(ds, da_normal, da_uniform=None, var=None, root=1.):
     if mask is not None:
         valids = xr.ufuncs.logical_or(mask, da_errors >= 0)
         da_errors = da_errors.where(valids, 0)
+
     return da_errors
 
 
-def process_gard_output(se, scen, periods, obs_ds, rand_ds,
+def process_gard_output(setname, scen, periods, obs_ds, rand_ds,
                         template=None, obs_mask=None,
                         calendar='standard',
                         variables=['pcp', 't_mean', 't_range'],
@@ -155,7 +142,7 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
 
     Parameters
     ----------
-    se : str
+    setname : str
         Set name
     scen : str
         Scenario name
@@ -188,7 +175,7 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
     See Also
     --------
     add_random_effect
-    make_gard_like_obs
+    tidy_gard
     '''
     if not isinstance(obs_ds, xr.Dataset):
         # we'll assume that obs_ds is a string/path/or something that
@@ -212,24 +199,16 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
         for drange in periods:
 
             drange = _tslice_to_str(drange)
-            pre = template.format(se=se, drange=drange, scen=scen)
+            pre = template.format(se=setname, drange=drange, scen=scen)
 
-            fname = pre + '{}.nc'.format(var)
-            ds = xr.open_dataset(fname, chunks=raw_chunks)
-            fname = pre + '{}_errors.nc'.format(var)
-            ds = ds.merge(xr.open_dataset(fname, chunks=raw_chunks))
-            try:
-                fname = pre + '{}_logistic.nc'.format(var)
-                ds.merge(xr.open_dataset(fname, chunks=raw_chunks))
+            files = [pre + '{}.nc'.format(var),
+                     pre + '{}_errors.nc'.format(var)]
+            exfile = pre + '{}_logistic.nc'.format(var)
+            if os.path.exists(exfile):
+                files.append(exfile)
                 exceedence_var = True
-            except (FileNotFoundError, OSError):
-                pass
 
-            ds = make_gard_like_obs(ds, obs_ds)
-            units = _get_units_from_drange(drange)
-            ds['time'] = pd.DatetimeIndex(
-                nctime_to_nptime(num2date(np.arange(0, ds.dims['time']),
-                                          units, calendar=calendar)))
+            ds = xr.open_mfdataset(files, preprocess=tidy_gard).chunk(chunks)
 
             ds_list.append(ds)
 
@@ -239,12 +218,12 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
             if v in obs_ds:
                 ds[v] = obs_ds[v]
 
-        # ds = ds.reindex_like(reindex_dates[scen])
+        date0 = ds.indexes['time'][0].strftime('%Y-%m-%d')
+        ds['time'] = xr.cftime_range(date0, periods=ds.dims['time'],
+                                     calendar=calendar, freq='1D')
         ds = ds.chunk(chunks=dict(time=ds.dims['time'], **chunks))
-        # ds[var] = ds[var].interpolate_na(
-        #     dim='time', kind='index', fill_value='extrapolate')
-        # calendar = 'standard'
 
+        print('renaming vars', flush=True)
         if rename_vars is not None and var in rename_vars:
             rename_dict = {}
             rename_dict[var] = rename_vars[var]
@@ -256,18 +235,23 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
             ds = ds.rename(rename_dict)
             var = rename_dict[var]
 
-        t0 = str(ds.coords['time'].data[0])
-        t1 = str(ds.coords['time'].data[-1])
+        print('clipping random data', flush=True)
+        # t0 = str(ds.indexes['time'][0].isoformat())
+        # t1 = str(ds.indexes['time'][-1].isoformat())
+        t0 = str(ds.indexes['time'][0].strftime('%Y-%m-%d'))
+        t1 = str(ds.indexes['time'][-1].strftime('%Y-%m-%d'))
         rand_ds = rand_ds.sel(time=slice(t0, t1))
+        # print('rand_ds', t0, t1, rand_ds)
 
-        if se != 'pass_through':
+        print('adding random effects', flush=True)
+        if setname != 'pass_through':
             root = roots[var]
             rand_var = rand_vars[var]
             da_errors = add_random_effect(ds, rand_ds[rand_var],
                                           rand_ds['p_rand_uniform'],
                                           var=var, root=root)
-
         else:
+            print('converting units', flush=True)
             if var == 'pcp':
                 da_errors = ds[var] * PASS_THROUGH_PCP_MULT
             elif var == 't_mean':
@@ -276,6 +260,7 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
                 da_errors = ds[var]
 
         # QC data after adding random effects
+        print('masking after the fact', flush=True)
         if var in ['pcp', 't_range']:
             da_errors = xr.where(da_errors > 0., da_errors, 0)
 
@@ -284,15 +269,17 @@ def process_gard_output(se, scen, periods, obs_ds, rand_ds,
         ds_out[var].encoding.update(encoding[var])
 
     # mask sure the dataset is properly masked
+    print('masking again, also metadata', flush=True)
     if obs_mask is not None:
-        ds_out = ds_out.where(obs_mask)
+        ds_out = ds_out.where(obs_mask > 0)
         ds_out['mask'] = obs_mask
         ds_out['mask'].attrs = attrs['mask']
         ds_out['mask'].encoding.update(encoding['mask'])
 
     # Add metadata
     ds_out['time'].encoding['calendar'] = calendar
-    ds_out['time'].encoding['units'] = units
+    # ds_out['time'].encoding['units'] = units
+    print('returning ds: \n%s' % ds_out, flush=True)
 
     return ds_out
 
@@ -310,7 +297,7 @@ def run(config_file, gcms=None, sets=None, variables=None,
     rename_vars = config['PostProc']['rename_vars']
     rand_file = config['PostProc']['rand_file']
 
-    chunks = config['PostProc'].get('chunks', None)
+    # chunks = config['PostProc'].get('chunks', None)
 
     # create directories if they don't exist yet
     data_dir = config['Options']['DataDir']
@@ -353,11 +340,9 @@ def run(config_file, gcms=None, sets=None, variables=None,
             calendar = config['Calendars'].get(
                 gcm, config['Calendars'].get('all', 'standard'))
 
-            rand_calendar = 'standard'  # TODO: get this from PostProc dict
-
             # Get random dataset
             rand_ds = get_rand_ds(rand_file, chunks=chunks,
-                                  calendar=rand_calendar)
+                                  calendar=calendar)
 
             for scen, drange in dset_config['scenario'].items():
 
@@ -394,10 +379,13 @@ def run(config_file, gcms=None, sets=None, variables=None,
                     rand_vars=rand_vars,
                     chunks=chunks)
 
+                print('done constructing output dataset', flush=True)
+
                 out_encoding = {}
-                for key in ds_out.variables:
+                for key in variables:
                     out_encoding[key] = ds_out[key].encoding
                     out_encoding[key].update(encoding.get(key, {}))
+                print(out_encoding)
 
                 ds_out.attrs = make_gloabl_attrs(
                     title='Post-processed GARD output downscaled dataset')
@@ -405,12 +393,15 @@ def run(config_file, gcms=None, sets=None, variables=None,
                 if return_processed:
                     out[dm_fname_out] = ds_out
                 else:
-                    print('writing %s' % dm_fname_out)
-                    ds_out.load().to_netcdf(dm_fname_out,
-                                            unlimited_dims=['time'],
-                                            format='NETCDF4',
-                                            encoding=out_encoding,
-                                            engine='h5netcdf')
+                    print('dataset:\n', ds_out, flush=True)
+                    print('size: %s' % (ds_out.nbytes / 1e9))
+                    print('loading data', flush=True)
+                    ds_out = ds_out.load(timeout='10s')
+                    print('writing %s' % dm_fname_out, flush=True)
+                    ds_out.to_netcdf(dm_fname_out,
+                                     unlimited_dims=['time'],
+                                     encoding=out_encoding)
+                    del ds_out
 
     if return_processed:
         return out
